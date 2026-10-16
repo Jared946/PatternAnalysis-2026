@@ -2,10 +2,13 @@
 loads 2D Medical Nifti Images for 2D baseline U-Net"
 """
 
+import random
 import numpy as np
-import nibable as nib
+import nibabel as nib
 from tqdm import tqdm
 
+#make sure to have 6 consistent labels
+#even when label does not appear
 def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
     channels = np.unique(arr)
     res = np.zeros(arr.shape + (len(channels),), dtype=dtype)
@@ -46,11 +49,10 @@ def load_data_2D(imageNames, normImage=False, categorical=False, dtype=np.
 
     for i, inName in enumerate(tqdm(imageNames)):
         niftiImage = nib.load(inName)
-        inImage = niftiImage.get_fdata(caching=’unchanged’) # read disk only
+        inImage = niftiImage.get_fdata(caching='unchanged') # read disk only
         affine = niftiImage.affine
         if len(inImage.shape) == 3:
-            inImage = inImage[:,:,0] # sometimes extra dims in HipMRI_study
-                data
+            inImage = inImage[:,:,0] # sometimes extra dims in HipMRI_study data
         inImage = inImage.astype(dtype)
         if normImage:
             inImage = (inImage - inImage.mean()) / (inImage.std() + 1e-8)
@@ -68,3 +70,21 @@ def load_data_2D(imageNames, normImage=False, categorical=False, dtype=np.
         return images, affines
     else:
         return images
+
+
+def split_patients(patient_ids, seed=42):
+    """Split unique patient IDs into train, validation and test sets."""
+    patient_ids = sorted(set(patient_ids))
+
+    rng = random.Random(seed)
+    rng.shuffle(patient_ids)
+
+    n = len(patient_ids)
+    n_train = round(n * 0.70)
+    n_eval = round(n * 0.15)
+
+    train_ids = set(patient_ids[:n_train])
+    eval_ids = set(patient_ids[n_train:n_train + n_eval])
+    test_ids = set(patient_ids[n_train + n_eval:])
+
+    return train_ids, eval_ids, test_ids
