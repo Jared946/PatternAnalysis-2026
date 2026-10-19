@@ -127,7 +127,7 @@ class MRI2DSliceDataset(Dataset):
 
     Each item returns:
         image: float32 tensor of shape (1, H, W)
-        mask: int64 tensor of shape (H, W)
+        mask: float32 one-hot tensor of shape (6, H, W)
     """
 
     def __init__(
@@ -135,7 +135,6 @@ class MRI2DSliceDataset(Dataset):
         image_names,
         label_names,
         normalise=True,
-        prostate_only=True,
     ):
         if len(image_names) != len(label_names):
             raise ValueError(
@@ -145,7 +144,6 @@ class MRI2DSliceDataset(Dataset):
         self.image_names = list(image_names)
         self.label_names = list(label_names)
         self.normalise = normalise
-        self.prostate_only = prostate_only
 
         # Index every 2D slice without loading all voxel data into RAM.
         self.slice_index = []
@@ -206,12 +204,11 @@ class MRI2DSliceDataset(Dataset):
                 image.std() + 1e-8
             )
 
-        if self.prostate_only:
-            mask = (mask == 5).astype(np.int64)
 
         # PyTorch Conv2d expects (channels, height, width).
         image = torch.from_numpy(image.copy()).unsqueeze(0)
-        mask = torch.from_numpy(mask.copy())
+        mask = to_channels(mask)
+        mask = torch.from_numpy(mask.copy()).permute(2, 0, 1).float()
 
         return image, mask
 
