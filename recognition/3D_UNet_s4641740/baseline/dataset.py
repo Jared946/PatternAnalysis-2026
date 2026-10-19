@@ -10,14 +10,14 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from pathlib import Path
 
-#make sure to have 6 consistent labels
-#even when label does not appear
 def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
-    channels = np.unique(arr)
-    res = np.zeros(arr.shape + (len(channels),), dtype=dtype)
-    for c in channels:
-        c = int(c)
-        res[..., c:c+1][arr == c] = 1
+    valid_labels = np.isin(arr, np.arange(6))
+    if not np.all(valid_labels):
+        raise ValueError("Segmentation contains labels outside 0-5.")
+
+    res = np.zeros(arr.shape + (6,), dtype=dtype)
+    for c in range(6):
+        res[..., c] = (arr == c)
 
     return res
 
@@ -147,7 +147,7 @@ class MRI2DSliceDataset(Dataset):
         self.normalise = normalise
         self.prostate_only = prostate_only
 
-        # Index every 2D slive without loading all voxel data into RAM.
+        # Index every 2D slice without loading all voxel data into RAM.
         self.slice_index = []
 
         for volume_idx, (image_path, label_path) in enumerate(
@@ -177,14 +177,9 @@ class MRI2DSliceDataset(Dataset):
                 )
 
             depth = image_nii.shape[2]
-            #print("Checking volume:", image_path.name)
-            #print("Volume shape:", image_nii.shape)
-            #print("Depth:", depth)
 
             for slice_idx in range(depth):
                 self.slice_index.append((volume_idx, slice_idx))
-        #print("Volumes received by dataset:", len(self.image_names))
-        #print("Slice entries created:", len(self.slice_index))
 
     def __len__(self):
         return len(self.slice_index)
