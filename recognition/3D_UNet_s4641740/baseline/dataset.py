@@ -6,6 +6,7 @@ import random
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
+from pathlib import Path
 
 #make sure to have 6 consistent labels
 #even when label does not appear
@@ -71,7 +72,35 @@ def load_data_2D(imageNames, normImage=False, categorical=False, dtype=np.
     else:
         return images
 
+def get_image_names(data_folder):
+    """Return sorted paths to all MRI NIfTI volumes."""
+    mri_folder = Path(data_folder) / "semantic_MRs_anon"
+    return sorted(mri_folder.glob("*.nii.gz"))
 
+def get_label_names(image_names, data_folder):
+    """Find the segmentation volume matching each MRI."""
+    label_folder = Path(data_folder) / "semantic_labels_anon"
+
+    label_names = []
+    for image_path in image_names:
+        label_name = image_path.name.replace(
+            "_LFOV.nii.gz",
+            "_SEMANTIC_LFOV.nii.gz",
+        )
+        label_names.append(label_folder / label_name)
+
+    return label_names
+
+def get_patient_ids(image_names):
+    """Extract unique patient IDs from MRI filenames."""
+    return sorted({
+        image_path.name.split("_")[1]
+        for image_path in image_names
+    })
+
+#ensure number of test cases are equal
+#e.g. test case could have 6 patient ids, but only 6 folders
+#whereas val case could have 6 patient ids, but 30 folders
 def split_patients(patient_ids, seed=42):
     """Split unique patient IDs into train, validation and test sets."""
     patient_ids = sorted(set(patient_ids))
@@ -81,10 +110,10 @@ def split_patients(patient_ids, seed=42):
 
     n = len(patient_ids)
     n_train = round(n * 0.70)
-    n_eval = round(n * 0.15)
+    n_val = round(n * 0.15)
 
     train_ids = set(patient_ids[:n_train])
-    eval_ids = set(patient_ids[n_train:n_train + n_eval])
-    test_ids = set(patient_ids[n_train + n_eval:])
+    val_ids = set(patient_ids[n_train:n_train + n_val])
+    test_ids = set(patient_ids[n_train + n_val:])
 
-    return train_ids, eval_ids, test_ids
+    return train_ids, val_ids, test_ids
