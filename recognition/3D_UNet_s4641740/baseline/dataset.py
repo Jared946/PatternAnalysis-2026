@@ -207,10 +207,74 @@ class MRI2DSliceDataset(Dataset):
             )
 
         # PyTorch Conv2d expects (channels, height, width).
-        image = torch.from_numpy(image.copy()).unsqueeze(0)
-        mask = to_channels(mask)
-        mask = torch.from_numpy(mask.copy()).permute(2, 0, 1).float()
+        image_tensor = torch.from_numpy(image.copy()).unsqueeze(0)
+        mask_tensor = (
+            torch.from_numpy(to_channels(mask).copy())
+            .permute(2, 0, 1)
+            .float()
+        )
 
-        return image, mask
+        return image_tensor, mask_tensor
 
+# Geometry of the U-Net
+POOLING_LEVELS = 4
+MIN_INPUT_SIZE = 188
+UNET_REMAINDER = 12
+UNET_STRIDE = 2 ** POOLING_LEVELS
 
+def paper_unet_size(size: int) -> int:
+    """Largest original-paper U-Net input size not greater than size."""
+    legal_size = size - (
+        (size - UNET_REMAINDER) % UNET_STRIDE
+    )
+
+    if legal_size < MIN_INPUT_SIZE:
+        raise ValueError(
+            f"Dimension {size} is too small for the paper U-Net; "
+            f"both dimensions must be at least {MIN_INPUT_SIZE}."
+        )
+
+    return legal_size
+
+class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
+    """Dataset adapter for the 2D U-Net
+
+    Returns:
+        image: float32 tensor [1, H, W]
+        target: long tensor [H, W] containing class IDs
+    """
+
+    def __init__(self, *args, random_crop=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.random_crop = random_crop
+
+    def __getitem__(self, index):
+        image, one_hot_mask = super().__getitem__(index)
+
+        # CrossEntropyLoss expects integer class IDs, not one-hot masks.
+        target = one_hot_mask.argmax(dim=0).to(dtype=torch.long)
+
+        height, width = image.shape[-2:]
+        crop_height = paper_unet_size(height)
+        crop_width = paper_unet_size(width)
+
+        max_top = height - crop_height
+        max_left = width - crop_width
+
+        if self.random_crop:
+            top = random.randint(0, max_top)
+            left = random.randint(0, max_left)
+        else:
+            top = max_top // 2
+            left = max_left // 2
+
+        return (
+            image[
+                ..., top:top + crop_height,
+                left:left + crop_width
+            ].contiguous(),
+            target[
+                top:top + crop_height,
+                left:left + crop_width
+            ].contiguous(),
+        )
