@@ -181,7 +181,7 @@ class MRI2DSliceDataset(Dataset):
                 image_nii.dataobj, dtype=np.float32
             )
             mask_volume = np.asarray(
-                label_nii.dataobj, dtype=np.int64
+                label_nii.dataobj, dtype=np.int8
             )
 
             self.images.append(image_volume)
