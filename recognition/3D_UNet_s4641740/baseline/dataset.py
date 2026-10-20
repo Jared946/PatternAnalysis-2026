@@ -145,8 +145,10 @@ class MRI2DSliceDataset(Dataset):
         self.label_names = list(label_names)
         self.normalise = normalise
 
-        # Index every 2D slice without loading all voxel data into RAM.
+        # Index every 2D slice
         self.slice_index = []
+        self.images = []
+        self.masks = []
 
         for volume_idx, (image_path, label_path) in enumerate(
             zip(self.image_names, self.label_names)
@@ -173,11 +175,22 @@ class MRI2DSliceDataset(Dataset):
                 raise ValueError(
                     f"Affine mismatch: {image_path.name}"
                 )
+            
+            # Load the entire volume into RAM instead of reopening it per slice.
+            image_volume = np.asarray(
+                image_nii.dataobj, dtype=np.float32
+            )
+            mask_volume = np.asarray(
+                label_nii.dataobj, dtype=np.int64
+            )
 
-            depth = image_nii.shape[2]
+            self.images.append(image_volume)
+            self.masks.append(mask_volume)
 
-            for slice_idx in range(depth):
-                self.slice_index.append((volume_idx, slice_idx))
+            self.slice_index.extend(
+                (volume_idx, slice_idx)
+                for slice_idx in range(image_nii.shape[2])
+            )
 
     def __len__(self):
         return len(self.slice_index)
@@ -185,25 +198,13 @@ class MRI2DSliceDataset(Dataset):
     def __getitem__(self, index):
         volume_idx, slice_idx = self.slice_index[index]
 
-        # Load the corresponding MRI and segmentation volumes.
-        image_nii = nib.load(str(self.image_names[volume_idx]))
-        label_nii = nib.load(str(self.label_names[volume_idx]))
-
-        # Extract the same axial slice from each.
-        image = np.asarray(
-            image_nii.dataobj[:, :, slice_idx],
-            dtype=np.float32,
-        )
-        mask = np.asarray(
-            label_nii.dataobj[:, :, slice_idx],
-            dtype=np.int64,
-        )
+        image = self.images[volume_idx][:, :, slice_idx]
+        mask = self.masks[volume_idx][:, :, slice_idx]
 
         if self.normalise:
             image = (image - image.mean()) / (
                 image.std() + 1e-8
             )
-
 
         # PyTorch Conv2d expects (channels, height, width).
         image = torch.from_numpy(image.copy()).unsqueeze(0)
@@ -211,6 +212,5 @@ class MRI2DSliceDataset(Dataset):
         mask = torch.from_numpy(mask.copy()).permute(2, 0, 1).float()
 
         return image, mask
-
 
 
