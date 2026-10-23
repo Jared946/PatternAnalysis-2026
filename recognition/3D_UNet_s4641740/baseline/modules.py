@@ -170,3 +170,4 @@ def paper_he_initialisation(module: nn.Module) -> None:
 
         if module.bias is not None:
             nn.init.zeros_(module.bias)
+

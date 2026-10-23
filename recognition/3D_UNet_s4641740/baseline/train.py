@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from dataset import (
     PaperUNetMRI2DSliceDataset,
+    PaperUNetPreSlicedDataset,
     get_image_names,
     get_label_names,
     get_patient_ids,
@@ -28,13 +29,13 @@ from modules import PaperUNet2D, crop_mask_to_logits
 
 NUM_CLASSES = 6
 
-def patient_id(image_path: Path) -> str:
-    """Use the filename convention already assumed by ``get_patient_ids``."""
-    parts = image_path.name.split("_")
-    if len(parts) < 2:
-        raise ValueError(f"Cannot extract patient ID from {image_path.name}")
-    return parts[1]
+DATA_FOLDER = Path(
+        "/home/groups/comp3710/HipMRI_Study_open"
+        )
 
+def patient_id(image_path: Path) -> str:
+    """Extract patient ID from the MRI filename."""
+    return image_path.name.split("_")[0]
 
 def select_partition(image_names, label_names, wanted_ids):
     return zip(*[(image, label) for image, label in zip(image_names, label_names)
@@ -104,10 +105,10 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=DATA_FOLDER)
     parser.add_argument("--output", type=Path,
             default=Path("checkpoints/unet2d_hipmri.pt"))
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=1) #was 100
     parser.add_argument("--batch-size", type=int,
             default=1, help="All slices in a batch must have equal dimensions.")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -123,13 +124,31 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+
     image_names = get_image_names(args.data_root)
-    if not image_names:
-        raise FileNotFoundError(f"No .nii.gz images in {args.data_root / 'semantic_MRs_anon'}")
     label_names = get_label_names(image_names, args.data_root)
-    train_ids, validation_ids, _ = split_patients(get_patient_ids(image_names))
-    train_dataset = make_dataset(image_names, label_names, train_ids)
-    validation_dataset = make_dataset(image_names, label_names, validation_ids)
+
+    patient_ids = get_patient_ids(image_names)
+
+    train_ids, validation_ids, test_ids = split_patients(patient_ids)
+
+    train_dataset = make_dataset(
+        image_names, label_names, train_ids
+    )
+    validation_dataset = make_dataset(
+        image_names, label_names, validation_ids
+    )
+    test_dataset = make_dataset(
+        image_names, label_names, test_ids
+    )
+
+    images, targets = next(iter(DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+    )))
+
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
             train_dataset,
@@ -143,7 +162,6 @@ def main():
             num_workers=args.workers,
             pin_memory=True)
 
-    #model = UNet2D(in_channels=1, num_classes=NUM_CLASSES).to(device)
     model = PaperUNet2D(in_channels=1, num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -184,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

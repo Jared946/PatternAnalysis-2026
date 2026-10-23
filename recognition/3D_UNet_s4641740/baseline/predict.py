@@ -13,6 +13,8 @@ import nibabel as nib
 import numpy as np
 import torch
 
+#from dataset import get_image_names
+#from modules import UNet2D
 from dataset import get_image_names, paper_unet_size
 from modules import PaperUNet2D
 
@@ -91,7 +93,6 @@ def output_name(image_path: Path) -> str:
     stem = name[:-7] if name.endswith(".nii.gz") else image_path.stem
     return f"{stem}_segmentation.nii.gz"
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -132,3 +133,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

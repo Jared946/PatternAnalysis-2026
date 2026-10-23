@@ -10,6 +10,12 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from pathlib import Path
 
+# Geometry of the U-Net
+POOLING_LEVELS = 4
+MIN_INPUT_SIZE = 188
+UNET_REMAINDER = 12
+UNET_STRIDE = 2 ** POOLING_LEVELS
+
 def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
     valid_labels = np.isin(arr, np.arange(6))
     if not np.all(valid_labels):
@@ -21,88 +27,47 @@ def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
 
     return res
 
-# load medical image functions
-def load_data_2D(imageNames, normImage=False, categorical=False, dtype=np.
-        float32, getAffines=False, early_stop=False):
-    '''
-    Load medical image data from names, cases list provided into a list for
-        each.
-
-    This function pre-allocates 4D arrays for conv2d to avoid excessive
-        memory usage.
-
-    normImage: bool (normalise the image 0.0-1.0)
-    early_stop: Stop loading pre-maturely, leaves arrays mostly empty, for
-        quick loading and testing scripts.
-    '''
-    affines = []
-
-    # get fixed size
-    num = len(imageNames)
-    first_case = nib.load(imageNames[0]).get_fdata(caching='unchanged')
-    if len(first_case.shape) == 3:
-        first_case = first_case[:,:,0] # sometimes extra dims, remove
-    if categorical:
-        first_case = to_channels(first_case, dtype=dtype)
-        rows, cols, channels = first_case.shape
-        images = np.zeros((num, rows, cols, channels), dtype=dtype)
-    else:
-        rows, cols = first_case.shape
-        images = np.zeros((num, rows, cols), dtype=dtype)
-
-    for i, inName in enumerate(tqdm(imageNames)):
-        niftiImage = nib.load(inName)
-        inImage = niftiImage.get_fdata(caching='unchanged') # read disk only
-        affine = niftiImage.affine
-        if len(inImage.shape) == 3:
-            inImage = inImage[:,:,0] # sometimes extra dims in HipMRI_study data
-        inImage = inImage.astype(dtype)
-        if normImage:
-            inImage = (inImage - inImage.mean()) / (inImage.std() + 1e-8)
-        if categorical:
-            inImage = to_channels(inImage, dtype=dtype)
-            images[i,:,:,:] = inImage
-        else:
-            images[i,:,:] = inImage
-
-        affines.append(affine)
-        if i > 20 and early_stop:
-            break
-
-    if getAffines:
-        return images, affines
-    else:
-        return images
-
 def get_image_names(data_folder):
-    """Return sorted paths to all MRI NIfTI volumes."""
-    mri_folder = Path(data_folder) / "semantic_MRs_anon"
-    return sorted(mri_folder.glob("*.nii.gz"))
+    """Return sorted paths to original MRI NIfTI volumes."""
+    mri_folder = Path(data_folder) / "semantic_MRs"
+    images = sorted(mri_folder.glob("*.nii.gz"))
+
+    if not images:
+        raise FileNotFoundError(
+            f"No MRI volumes found in {mri_folder}"
+        )
+
+    return images
 
 def get_label_names(image_names, data_folder):
     """Find the segmentation volume matching each MRI."""
-    label_folder = Path(data_folder) / "semantic_labels_anon"
+    label_folder = Path(data_folder) / "semantic_labels_only"
 
     label_names = []
     for image_path in image_names:
         label_name = image_path.name.replace(
             "_LFOV.nii.gz",
-            "_SEMANTIC_LFOV.nii.gz",
+            "_SEMANTIC.nii.gz",
         )
-        label_names.append(label_folder / label_name)
+        label_path = label_folder / label_name
+
+        if not label_path.is_file():
+            raise FileNotFoundError(
+                f"Missing segmentation for {image_path.name}: "
+                f"{label_path}"
+            )
+
+        label_names.append(label_path)
 
     return label_names
 
 def get_patient_ids(image_names):
     """Extract unique patient IDs from MRI filenames."""
     return sorted({
-        image_path.name.split("_")[1]
+        image_path.name.split("_")[0]
         for image_path in image_names
     })
 
-#ensure number of test cases are equal
-#e.g. test case could have 6 patient ids, but only 6 folders
-#whereas val case could have 6 patient ids, but 30 folders
 def split_patients(patient_ids):
     """Split unique patient IDs into train, validation and test sets."""
     train_ids = {f"case_{i:03d}" for i in range(4, 36)}
@@ -111,22 +76,12 @@ def split_patients(patient_ids):
 
     available_ids = set(patient_ids)
 
-    # Check that every expected patient exists.
-    assert train_ids <= available_ids, (
-        f"Missing training IDs: {train_ids - available_ids}"
-    )
-    assert val_ids <= available_ids, (
-        f"Missing validation IDs: {val_ids - available_ids}"
-    )
-    assert test_ids <= available_ids, (
-        f"Missing test IDs: {test_ids - available_ids}"
-    )
-
     assert train_ids.isdisjoint(val_ids)
     assert train_ids.isdisjoint(test_ids)
     assert val_ids.isdisjoint(test_ids)
 
     return train_ids, val_ids, test_ids
+
 
 class MRI2DSliceDataset(Dataset):
     """
@@ -182,8 +137,8 @@ class MRI2DSliceDataset(Dataset):
                 raise ValueError(
                     f"Affine mismatch: {image_path.name}"
                 )
-            
-            # Load the entire volume into RAM instead of reopening it per slice.
+
+            # Load the entire volume into RAM
             image_volume = np.asarray(
                 image_nii.dataobj, dtype=np.float32
             )
@@ -223,11 +178,6 @@ class MRI2DSliceDataset(Dataset):
 
         return image_tensor, mask_tensor
 
-# Geometry of the U-Net
-POOLING_LEVELS = 4
-MIN_INPUT_SIZE = 188
-UNET_REMAINDER = 12
-UNET_STRIDE = 2 ** POOLING_LEVELS
 
 def paper_unet_size(size: int) -> int:
     """Largest original-paper U-Net input size not greater than size."""
@@ -300,7 +250,7 @@ class PaperUNetPreSlicedDataset(Dataset):
             raise ValueError(f"No NIfTI images found in {self.image_dir}")
 
         self.label_paths = [
-            self.label_dir / image_path.name
+            self.label_dir / image_path.name.replace("case_", "seg_", 1)
             for image_path in self.image_paths
         ]
 
@@ -322,6 +272,14 @@ class PaperUNetPreSlicedDataset(Dataset):
         mask = np.asarray(
             nib.load(str(self.label_paths[index])).dataobj,
         ).squeeze()
+
+        print('===================================================', flush=True)
+        if image.shape != (256, 256):
+            print(
+                f"Unexpected dimensions: {self.image_paths[index].name}, "
+                f"image={image.shape}, mask={mask.shape}",
+                flush=True,
+            )
 
         if image.ndim != 2 or mask.ndim != 2:
             raise ValueError(
@@ -374,3 +332,4 @@ class PaperUNetPreSlicedDataset(Dataset):
         target_tensor = torch.from_numpy(mask).long()
 
         return image_tensor, target_tensor
+
