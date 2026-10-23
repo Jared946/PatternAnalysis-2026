@@ -103,23 +103,30 @@ def get_patient_ids(image_names):
 #ensure number of test cases are equal
 #e.g. test case could have 6 patient ids, but only 6 folders
 #whereas val case could have 6 patient ids, but 30 folders
-def split_patients(patient_ids, seed=42):
+def split_patients(patient_ids):
     """Split unique patient IDs into train, validation and test sets."""
-    patient_ids = sorted(set(patient_ids))
+    train_ids = {f"case_{i:03d}" for i in range(4, 36)}
+    val_ids = {f"case_{i:03d}" for i in range(36, 40)}
+    test_ids = {f"case_{i:03d}" for i in range(40, 43)}
 
-    rng = random.Random(seed)
-    rng.shuffle(patient_ids)
+    available_ids = set(patient_ids)
 
-    n = len(patient_ids)
-    n_train = round(n * 0.70)
-    n_val = round(n * 0.15)
+    # Check that every expected patient exists.
+    assert train_ids <= available_ids, (
+        f"Missing training IDs: {train_ids - available_ids}"
+    )
+    assert val_ids <= available_ids, (
+        f"Missing validation IDs: {val_ids - available_ids}"
+    )
+    assert test_ids <= available_ids, (
+        f"Missing test IDs: {test_ids - available_ids}"
+    )
 
-    train_ids = set(patient_ids[:n_train])
-    val_ids = set(patient_ids[n_train:n_train + n_val])
-    test_ids = set(patient_ids[n_train + n_val:])
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids.isdisjoint(test_ids)
+    assert val_ids.isdisjoint(test_ids)
 
     return train_ids, val_ids, test_ids
-
 
 class MRI2DSliceDataset(Dataset):
     """
@@ -278,3 +285,92 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
                 left:left + crop_width
             ].contiguous(),
         )
+
+class PaperUNetPreSlicedDataset(Dataset):
+    """Load pre-sliced 2D MRI images and their segmentation masks."""
+
+    def __init__(self, image_dir, label_dir, normalise=True):
+        self.image_dir = Path(image_dir)
+        self.label_dir = Path(label_dir)
+        self.normalise = normalise
+
+        self.image_paths = sorted(self.image_dir.glob("*.nii.gz"))
+
+        if not self.image_paths:
+            raise ValueError(f"No NIfTI images found in {self.image_dir}")
+
+        self.label_paths = [
+            self.label_dir / image_path.name
+            for image_path in self.image_paths
+        ]
+
+        for label_path in self.label_paths:
+            if not label_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing segmentation: {label_path}"
+                )
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        image = np.asarray(
+            nib.load(str(self.image_paths[index])).dataobj,
+            dtype=np.float32,
+        ).squeeze()
+
+        mask = np.asarray(
+            nib.load(str(self.label_paths[index])).dataobj,
+        ).squeeze()
+
+        if image.ndim != 2 or mask.ndim != 2:
+            raise ValueError(
+                f"Expected 2D slices, got image {image.shape}, "
+                f"mask {mask.shape}"
+            )
+
+        if image.shape != mask.shape:
+            raise ValueError(
+                f"Image/mask shape mismatch for "
+                f"{self.image_paths[index].name}"
+            )
+
+        if not np.all(np.isfinite(image)):
+            raise ValueError("MRI contains non-finite values.")
+
+        if not np.all(np.isfinite(mask)):
+            raise ValueError("Mask contains non-finite values.")
+
+        if not np.allclose(mask, np.round(mask)):
+            raise ValueError("Mask contains non-integer class values.")
+
+        mask = np.round(mask).astype(np.int64)
+
+        if not np.all(np.isin(mask, np.arange(6))):
+            raise ValueError("Mask contains labels outside 0-5.")
+
+        if self.normalise:
+            image = (image - image.mean()) / (image.std() + 1e-8)
+
+        # Apply the same paper U-Net input geometry as training before.
+        height, width = image.shape
+        crop_height = paper_unet_size(height)
+        crop_width = paper_unet_size(width)
+
+        top = (height - crop_height) // 2
+        left = (width - crop_width) // 2
+
+        image = image[
+            top:top + crop_height,
+            left:left + crop_width,
+        ].copy()
+
+        mask = mask[
+            top:top + crop_height,
+            left:left + crop_width,
+        ].copy()
+
+        image_tensor = torch.from_numpy(image).unsqueeze(0)
+        target_tensor = torch.from_numpy(mask).long()
+
+        return image_tensor, target_tensor

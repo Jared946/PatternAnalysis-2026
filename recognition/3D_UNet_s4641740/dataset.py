@@ -52,29 +52,24 @@ def get_patient_ids(images):
     """Return sorted unique patient IDs from MRI paths."""
     return sorted({patient_id(path) for path in images})
 
-def split_patients(patient_ids, seed=42):
+def split_patients(patient_ids):
     """Split unique patient IDs into train, validation and test sets."""
-    patient_ids = sorted(set(patient_ids))
+    train_ids = {f"case_{i:03d}" for i in range(4, 36)}
+    val_ids = {f"case_{i:03d}" for i in range(36, 40)}
+    test_ids = {f"case_{i:03d}" for i in range(40, 43)}
 
-    rng = random.Random(seed)
-    rng.shuffle(patient_ids)
+    available_ids = set(patient_ids)
 
-    n = len(patient_ids)
-    n_train = round(n * 0.70)
-    n_val = round(n * 0.15)
-
-    train_ids = set(patient_ids[:n_train])
-    val_ids = set(
-        patient_ids[n_train:n_train + n_val]
+    # Check that every expected patient exists.
+    assert train_ids <= available_ids, (
+        f"Missing training IDs: {train_ids - available_ids}"
     )
-    test_ids = set(
-        patient_ids[n_train + n_val:]
+    assert val_ids <= available_ids, (
+        f"Missing validation IDs: {val_ids - available_ids}"
     )
-
-    #Verification
-    print("Train patients:", sorted(train_ids))
-    print("Validation patients:", sorted(val_ids))
-    print("Test patients:", sorted(test_ids))
+    assert test_ids <= available_ids, (
+        f"Missing test IDs: {test_ids - available_ids}"
+    )
 
     assert train_ids.isdisjoint(val_ids)
     assert train_ids.isdisjoint(test_ids)
