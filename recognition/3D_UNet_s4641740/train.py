@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse, random
 from pathlib import Path
 import numpy as np
+import csv
 import time
 import os
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import (
     MRI3DVolumeDataset,
@@ -18,150 +20,526 @@ from dataset import (
 )
 from modules import UNet3D
 
+NUM_CLASSES = 6
+
 def dice(logits, target):
-    prediction = logits.argmax(1)
+    """Calculate mean foreground Dice for one batch.
+
+    Background (class 0) is excluded. A class absent from both
+    prediction and target is excluded from the mean.
+    """
+    prediction = logits.argmax(dim=1)
     scores = []
-    for c in range(1, 6):
-        p, t = prediction == c, target == c
-        denom = p.sum().item() + t.sum().item()
-        if denom:
-            scores.append(2 * (p & t).sum().item() / denom)
+    for c in range(1, NUM_CLASSES):
+        pred_mask = predictions == c
+        target_mask = targets == c
+
+        denominator = pred_mask.sum().item() + target_mask.sum().item()
+
+        if denominator > 0:
+            intersection = (pred_mask & target_mask).sum().item()
+            scores.append(2.0 * intersection / denominator)
 
     return float(np.mean(scores)) if scores else 1.0
 
 def epoch(model, loader, loss_fn, device, optimizer = None):
-    train = optimizer is not None
-    model.train(train)
-    loss = dice_sum = 0.0
-    for images, targets in loader:
-        images, targets = images.to(device), targets.to(device)
-        with torch.set_grad_enabled(train):
-            logits = model(images)
-            value = loss_fn(logits, targets)
-            if train:
-                optimizer.zero_grad(set_to_none = True)
-                value.backward()
-                optimizer.step()
-        loss += value.item()
-        dice_sum += dice(logits.detach(), targets)
+    """Run one training or validation epoch.
 
-    return loss / len(loader), dice_sum / len(loader)
+    Loss is averaged over batches. Dice is calculated from accumulated
+    class-wise voxel counts across the entire loader, rather than
+    averaging the Dice score of each batch equally.
+    """
+    training = optimizer is not None
+    model.train(training)
+
+    loss_sum = 0.0
+    batch_count = 0
+
+    intersections = np.zeros(NUM_CLASSES, dtype=np.float64)
+    denominators = np.zeros(NUM_CLASSES, dtype=np.float64)
+
+    with torch.set_grad_enabled(training):
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            logits = model(images)
+            loss = loss_fn(logits, targets)
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+            loss_sum += loss.item()
+            batch_count += 1
+
+            predictions = logits.detach().argmax(dim=1)
+
+            for c in range(1, NUM_CLASSES):
+                pred_mask = predictions == c
+                target_mask = targets == c
+
+                intersections[c] += (
+                    pred_mask & target_mask
+                ).sum().item()
+
+                denominators[c] += (
+                    pred_mask.sum().item()
+                    + target_mask.sum().item()
+                )
+
+    if batch_count == 0:
+        raise ValueError(
+            "The DataLoader contains no batches. Check the patient split "
+            "and dataset construction."
+        )
+
+    class_scores = []
+
+    for c in range(1, NUM_CLASSES):
+        if denominators[c] > 0:
+            class_scores.append(
+                2.0 * intersections[c] / denominators[c]
+            )
+
+    mean_dice = (
+        float(np.mean(class_scores)) if class_scores else 1.0
+    )
+
+    return loss_sum / batch_count, mean_dice
+
+def evaluate_test(model, test_loader, device):
+    """Evaluate complete test volumes and report patient-level Dice.
+
+    Accumulates class intersections and denominators across all volumes
+    belonging to each patient. Background class 0 is excluded.
+    """
+    model.eval()
+
+    # patient_id -> per-class intersection and denominator
+    patient_stats = {}
+    volume_index = 0
+
+    with torch.inference_mode():
+        for images, targets in test_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # Batch size must be 1 because full volumes can differ in size.
+            if images.shape[0] != 1:
+                raise ValueError(
+                    "Full-volume test evaluation requires batch_size=1."
+                )
+
+            image_path = test_loader.dataset.pairs[volume_index][0]
+            volume_index += 1
+            pid = image_path.name.split("_")[0]
+
+            # Preserve the original spatial dimensions.
+            _, _, d, h, w = images.shape
+
+            # Pad at the end of each dimension to multiples of 16.
+            pd = (-d) % 16
+            ph = (-h) % 16
+            pw = (-w) % 16
+
+            if pd or ph or pw:
+                images = F.pad(
+                    images,
+                    (0, pw, 0, ph, 0, pd),
+                    mode="replicate",
+                )
+
+            logits = model(images)
+
+            # Remove the padding from the predictions.
+            logits = logits[:, :, :d, :h, :w]
+            predictions = logits.argmax(dim=1)
+
+            # Each dataset item corresponds to one MRI volume.
+            # The loader must use shuffle=False.
+            volume_index = evaluate_test.volume_index
+            image_path = test_loader.dataset.pairs[volume_index][0]
+            evaluate_test.volume_index += 1
+
+            pid = image_path.name.split("_")[0]
+
+            if pid not in patient_stats:
+                patient_stats[pid] = {
+                    "intersection": np.zeros(NUM_CLASSES, dtype=np.float64),
+                    "denominator": np.zeros(NUM_CLASSES, dtype=np.float64),
+                }
+
+            stats = patient_stats[pid]
+
+            for c in range(1, NUM_CLASSES):
+                pred_mask = predictions == c
+                target_mask = targets == c
+
+                stats["intersection"][c] += (
+                    pred_mask & target_mask
+                ).sum().item()
+
+                stats["denominator"][c] += (
+                    pred_mask.sum().item()
+                    + target_mask.sum().item()
+                )
+
+    # Calculate Dice for each patient, excluding classes absent from
+    # both prediction and target for that patient.
+    patient_scores = {}
+    class_scores = {c: [] for c in range(1, NUM_CLASSES)}
+
+    for pid, stats in patient_stats.items():
+        scores = []
+
+        for c in range(1, NUM_CLASSES):
+            denom = stats["denominator"][c]
+
+            if denom > 0:
+                score = 2.0 * stats["intersection"][c] / denom
+                scores.append(score)
+                class_scores[c].append(score)
+
+        patient_scores[pid] = float(np.mean(scores)) if scores else 1.0
+
+    print("\n========== FULL-VOLUME TEST RESULTS ==========")
+
+    for pid in sorted(patient_scores):
+        print(f"Patient {pid}: mean foreground Dice = {patient_scores[pid]:.4f}")
+
+    if patient_scores:
+        print(
+            f"\nMean patient Dice: "
+            f"{np.mean(list(patient_scores.values())):.4f}"
+        )
+
+    for c in range(1, NUM_CLASSES):
+        if class_scores[c]:
+            print(
+                f"Class {c} mean patient Dice: "
+                f"{np.mean(class_scores[c]):.4f}"
+            )
+        else:
+            print(f"Class {c} mean patient Dice: N/A")
+
+    print("==============================================")
+
+    return patient_scores
+
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--data-root',type=Path,
-            default=Path('/home/groups/comp3710/HipMRI_Study_open'))
-    p.add_argument('--output',type=Path,
-            default=Path('checkpoints/unet3d_hipmri.pt'))
-    p.add_argument('--patch-size',nargs=3,type=int,
-            default=(64,128,128),metavar=('D','H','W'))
-    p.add_argument('--base-channels',type=int,default=16,
-            help='Set 64 for the 2-D channel widths; 16 is practical for 3-D memory.')
-    p.add_argument('--epochs',type=int,default=20) #was 100
-    p.add_argument('--batch-size',type=int,default=1)
-    p.add_argument('--lr',type=float,default=1e-4)
-    p.add_argument('--workers',type=int,default=1)
-    p.add_argument('--seed',type=int,default=42)
-    p.add_argument('--device',default='cuda' if torch.cuda.is_available()
-            else 'cpu')
-    a = p.parse_args()
-    random.seed(a.seed)
-    np.random.seed(a.seed)
-    torch.manual_seed(a.seed)
-    images = get_image_names(a.data_root)
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("/home/groups/comp3710/HipMRI_Study_open"),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("checkpoints/unet3d_hipmri.pt"),
+    )
+    parser.add_argument(
+        "--patch-size",
+        nargs=3,
+        type=int,
+        default=(64, 128, 128),
+        metavar=("D", "H", "W"),
+    )
+    parser.add_argument(
+        "--base-channels",
+        type=int,
+        default=16,
+        help="Base channel width; 16 is a practical starting point for 3D.",
+    )
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+
+    args = parser.parse_args()
+
+    # Reproducibility.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Find MRI volumes and corresponding masks.
+    images = get_image_names(args.data_root)
+
     if not images:
         raise FileNotFoundError(
-            f'No volumes found under {a.data_root / "semantic_MRs"}'
+            f"No volumes found under {args.data_root / 'semantic_MRs'}"
         )
-    labels = get_label_names(images, a.data_root)
+
+    labels = get_label_names(images, args.data_root)
     patient_ids = get_patient_ids(images)
+
     train_ids, val_ids, test_ids = split_patients(patient_ids)
+
     train_pairs = select_pairs(images, labels, train_ids)
     val_pairs = select_pairs(images, labels, val_ids)
-    train_ds = MRI3DVolumeDataset(*zip(*train_pairs),
-            patch_size = a.patch_size, random_patch = True)
-    val_ds = MRI3DVolumeDataset(*zip(*val_pairs), patch_size = a.patch_size)
-    device = torch.device(a.device)
-    common = dict(batch_size = a.batch_size, num_workers = a.workers,
-            pin_memory = device.type == 'cuda')
-    train_loader = DataLoader(train_ds, shuffle = True, **common)
-    val_loader = DataLoader(val_ds, shuffle = False, **common)
-    model = UNet3D(base_channels = a.base_channels).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr = a.lr)
+    test_pairs = select_pairs(images, labels, test_ids)
+
+    if not train_pairs:
+        raise ValueError("No training volumes matched the training IDs.")
+    if not val_pairs:
+        raise ValueError("No validation volumes matched the validation IDs.")
+    if not test_pairs:
+        raise ValueError("No test volumes matched the test IDs.")
+
+    print("\n========== DATASET SPLIT ==========")
+    print(f"Training patients:   {len(train_ids)}")
+    print(f"Validation patients: {len(val_ids)}")
+    print(f"Test patients:       {len(test_ids)}")
+    print(f"Training volumes:    {len(train_pairs)}")
+    print(f"Validation volumes:  {len(val_pairs)}")
+    print(f"Test volumes:        {len(test_pairs)}")
+    print("===================================\n")
+
+    # Training uses random patches; validation uses the dataset's
+    # default patch selection behaviour.
+    train_ds = MRI3DVolumeDataset(
+        *zip(*train_pairs),
+        patch_size=tuple(args.patch_size),
+        random_patch=True,
+    )
+    val_ds = MRI3DVolumeDataset(
+        *zip(*val_pairs),
+        patch_size=tuple(args.patch_size),
+    )
+    test_ds = MRI3DVolumeDataset(
+        *zip(*test_pairs),
+        patch_size=None,
+    )
+
+    device = torch.device(args.device)
+
+    common_loader_args = {
+        "batch_size": args.batch_size,
+        "num_workers": args.workers,
+        "pin_memory": device.type == "cuda",
+    }
+
+    train_loader = DataLoader(
+        train_ds,
+        shuffle=True,
+        **common_loader_args,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        shuffle=False,
+        **common_loader_args,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+
+    model = UNet3D(base_channels=args.base_channels).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = nn.CrossEntropyLoss()
-    a.output.parent.mkdir(parents = True, exist_ok = True)
-    best =- float('inf')
 
-    # Reset GPU memory statistics before measuring training.
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    training_start = time.perf_counter()
+    # Store the CSV alongside the checkpoint.
+    csv_path = args.output.with_suffix(".csv")
+
+    best_val_dice = -float("inf")
     checkpoint_saved = False
 
-    for e in range(1, a.epochs + 1):
-        epoch_start = time.perf_counter()
+    # Track the highest per-epoch peaks for the overall summary.
+    overall_peak_allocated = 0.0
+    overall_peak_reserved = 0.0
 
-        # Training and validation
-        tl, td = epoch(model, train_loader, loss_fn, device, optimizer)
-        vl, vd = epoch(model, val_loader, loss_fn, device)
-        print(f'Epoch {e:03d}/{a.epochs}: train loss={tl:.4f}, dice={td:.4f} | val loss={vl:.4f}, dice={vd:.4f}')
-        # Save the best checkpoint
-        if vd > best:
-            best = vd
-            torch.save({'epoch': e,
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'best_validation_dice': best,
-                'in_channels': 1,
-                'num_classes': 6,
-                'base_channels': a.base_channels,
-                'architecture': 'UNet3D'}, a.output)
+    training_start = time.perf_counter()
 
-            checkpoint_saved = a.output.is_file()
+    print(f"Device: {device}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Patch size (D, H, W): {tuple(args.patch_size)}")
+    print(f"Base channels: {args.base_channels}")
+    print(f"Checkpoint: {args.output}")
+    print(f"CSV log: {csv_path}\n")
 
-            print(f'Saved best checkpoint to {a.output}')
+    csv_fields = [
+        "epoch",
+        "train_loss",
+        "train_dice",
+        "val_loss",
+        "val_dice",
+        "best_val_dice",
+        "epoch_seconds",
+        "peak_gpu_allocated_gib",
+        "peak_gpu_reserved_gib",
+        "learning_rate",
+    ]
 
-        # Synchronise CUDA so GPU work is included in the timing
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
+    # Start a new log for this run.
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+        writer.writeheader()
+        csv_file.flush()
 
-        epoch_seconds = time.perf_counter() - epoch_start
+        for e in range(1, args.epochs + 1):
+            # Reset peak statistics so memory is measured separately
+            # for each epoch, including training and validation.
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
 
-        print(f'\nEpoch {e:03d}/{a.epochs}')
-        print(f'  Training loss:   {tl:.4f}')
-        print(f'  Training Dice:   {td:.4f}')
-        print(f'  Validation loss: {vl:.4f}')
-        print(f'  Validation Dice: {vd:.4f}')
-        print(f'  Epoch runtime:   {epoch_seconds:.2f} seconds')
+            epoch_start = time.perf_counter()
 
-    # Summary
-    if device.type == 'cuda':
+            # Training.
+            train_loss, train_dice = epoch(
+                model,
+                train_loader,
+                loss_fn,
+                device,
+                optimizer,
+            )
+
+            # Validation.
+            val_loss, val_dice = epoch(
+                model,
+                val_loader,
+                loss_fn,
+                device,
+            )
+
+            # Save the checkpoint with the best validation Dice.
+            if val_dice > best_val_dice:
+                best_val_dice = val_dice
+
+                torch.save(
+                    {
+                        "epoch": e,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "best_validation_dice": best_val_dice,
+                        "in_channels": 1,
+                        "num_classes": NUM_CLASSES,
+                        "base_channels": args.base_channels,
+                        "architecture": "UNet3D",
+                    },
+                    args.output,
+                )
+
+                checkpoint_saved = args.output.is_file()
+                print(f"Saved best checkpoint to {args.output}")
+
+            # Synchronise before stopping the timer so CUDA operations
+            # are included in the epoch duration.
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            epoch_seconds = time.perf_counter() - epoch_start
+
+            # GPU memory peaks for this epoch.
+            if device.type == "cuda":
+                peak_allocated = (
+                    torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                )
+                peak_reserved = (
+                    torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+                )
+
+                overall_peak_allocated = max(
+                    overall_peak_allocated, peak_allocated
+                )
+                overall_peak_reserved = max(
+                    overall_peak_reserved, peak_reserved
+                )
+            else:
+                peak_allocated = float("nan")
+                peak_reserved = float("nan")
+
+            learning_rate = optimizer.param_groups[0]["lr"]
+
+            # Terminal report.
+            print(f"\nEpoch {e:03d}/{args.epochs}")
+            print(f"  Training loss:       {train_loss:.4f}")
+            print(f"  Training Dice:       {train_dice:.4f}")
+            print(f"  Validation loss:     {val_loss:.4f}")
+            print(f"  Validation Dice:     {val_dice:.4f}")
+            print(f"  Best validation Dice:{best_val_dice: .4f}")
+            print(f"  Epoch runtime:       {epoch_seconds:.2f} seconds")
+
+            if device.type == "cuda":
+                print(
+                    f"  Peak GPU allocated:  {peak_allocated:.3f} GiB"
+                )
+                print(
+                    f"  Peak GPU reserved:   {peak_reserved:.3f} GiB"
+                )
+            else:
+                print("  GPU memory:           Not applicable (CPU execution)")
+
+            # Persist this epoch's metrics immediately.
+            writer.writerow(
+                {
+                    "epoch": e,
+                    "train_loss": train_loss,
+                    "train_dice": train_dice,
+                    "val_loss": val_loss,
+                    "val_dice": val_dice,
+                    "best_val_dice": best_val_dice,
+                    "epoch_seconds": epoch_seconds,
+                    "peak_gpu_allocated_gib": peak_allocated,
+                    "peak_gpu_reserved_gib": peak_reserved,
+                    "learning_rate": learning_rate,
+                }
+            )
+            csv_file.flush()
+
+    if device.type == "cuda":
         torch.cuda.synchronize(device)
 
     total_seconds = time.perf_counter() - training_start
 
-    print('\n========== SUMMARY ==========')
-    print(f'Total training runtime: {total_seconds:.2f} seconds')
-    print(f'Total training runtime: {total_seconds / 60:.2f} minutes')
+    print("\n========== TRAINING SUMMARY ==========")
+    print("Training completed: YES")
+    print("Validation completed: YES")
+    print(f"Total training runtime: {total_seconds:.2f} seconds")
+    print(f"Total training runtime: {total_seconds / 60:.2f} minutes")
+    print(f"Best validation Dice:   {best_val_dice:.4f}")
 
-    if device.type == 'cuda':
-        peak_allocated = (
-            torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    if device.type == "cuda":
+        print(
+            f"Overall peak GPU allocated: {overall_peak_allocated:.3f} GiB"
         )
-        peak_reserved = (
-            torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        print(
+            f"Overall peak GPU reserved:  {overall_peak_reserved:.3f} GiB"
         )
-
-        print(f'Peak GPU memory allocated: {peak_allocated:.3f} GiB')
-        print(f'Peak GPU memory reserved:  {peak_reserved:.3f} GiB')
     else:
-        print('GPU memory: Not applicable (CPU execution)')
+        print("GPU memory: Not applicable (CPU execution)")
 
-    print(f'Checkpoint saved successfully: {checkpoint_saved}')
-    print(f'Checkpoint path: {a.output}')
-    print('=========================================')
+    print(f"Checkpoint saved:       {checkpoint_saved}")
+    print(f"Checkpoint path:        {args.output}")
+    print(f"CSV log path:           {csv_path}")
+    print("======================================")
+
+    if not checkpoint_saved:
+        raise RuntimeError("No best checkpoint was saved; cannot evaluate test set.")
+
+    checkpoint = torch.load(args.output, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+
+    print(f"\nLoaded best checkpoint from epoch {checkpoint['epoch']}")
+    evaluate_test(model, test_loader, device)
 
 if __name__=='__main__':
     main()
