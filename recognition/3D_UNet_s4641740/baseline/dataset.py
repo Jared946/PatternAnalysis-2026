@@ -70,15 +70,18 @@ def get_patient_ids(image_names):
 
 def split_patients(patient_ids):
     """Split unique patient IDs into train, validation and test sets."""
-    train_ids = {f"case_{i:03d}" for i in range(4, 36)}
-    val_ids = {f"case_{i:03d}" for i in range(36, 40)}
-    test_ids = {f"case_{i:03d}" for i in range(40, 43)}
-
-    available_ids = set(patient_ids)
-
-    assert train_ids.isdisjoint(val_ids)
-    assert train_ids.isdisjoint(test_ids)
-    assert val_ids.isdisjoint(test_ids)
+    train_ids = {
+        pid for pid in patient_ids
+        if 4 <= int(pid[1:4]) <= 35
+    }
+    val_ids = {
+        pid for pid in patient_ids
+        if 36 <= int(pid[1:4]) <= 39
+    }
+    test_ids = {
+        pid for pid in patient_ids
+        if 40 <= int(pid[1:4]) <= 42
+    }
 
     return train_ids, val_ids, test_ids
 
