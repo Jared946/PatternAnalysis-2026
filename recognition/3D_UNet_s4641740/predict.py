@@ -46,7 +46,7 @@ def predict(model, xyz, patch_size, device):
 def main():
     p = argparse.ArgumentParser(description = __doc__)
     p.add_argument('--data-root',type=Path,
-            default=Path('/home/groups/comp3710/HipMRI_Study_open/'))
+            default=Path('C:/Users/User/SEMESTER 2/COMP3710/project/HipMRI_Study_open'))
     p.add_argument('--checkpoint',type=Path,
             default=Path('checkpoints/unet3d_hipmri.pt'))
     p.add_argument('--output-dir',type=Path,default=Path('inference/'))

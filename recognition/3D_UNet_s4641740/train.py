@@ -157,14 +157,6 @@ def evaluate_test(model, test_loader, device):
             logits = logits[:, :, :d, :h, :w]
             predictions = logits.argmax(dim=1)
 
-            # Each dataset item corresponds to one MRI volume.
-            # The loader must use shuffle=False.
-            volume_index = evaluate_test.volume_index
-            image_path = test_loader.dataset.pairs[volume_index][0]
-            evaluate_test.volume_index += 1
-
-            pid = image_path.name.split("_")[0]
-
             if pid not in patient_stats:
                 patient_stats[pid] = {
                     "intersection": np.zeros(NUM_CLASSES, dtype=np.float64),
@@ -235,7 +227,7 @@ def main():
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("/home/groups/comp3710/HipMRI_Study_open"),
+        default=Path("C:/Users/User/SEMESTER 2/COMP3710/project/HipMRI_Study_open"),
     )
     parser.add_argument(
         "--output",
