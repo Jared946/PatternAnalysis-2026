@@ -31,8 +31,8 @@ def dice(logits, target):
     prediction = logits.argmax(dim=1)
     scores = []
     for c in range(1, NUM_CLASSES):
-        pred_mask = predictions == c
-        target_mask = targets == c
+        pred_mask = prediction == c
+        target_mask = target == c
 
         denominator = pred_mask.sum().item() + target_mask.sum().item()
 
@@ -54,12 +54,15 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
 
     loss_sum = 0.0
     batch_count = 0
+    samples_seen = 0
 
     intersections = np.zeros(NUM_CLASSES, dtype=np.float64)
     denominators = np.zeros(NUM_CLASSES, dtype=np.float64)
 
     with torch.set_grad_enabled(training):
         for images, targets in loader:
+            samples_seen += images.shape[0]
+
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -94,6 +97,20 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             "The DataLoader contains no batches. Check the patient split "
             "and dataset construction."
         )
+
+    expected_samples = len(loader.dataset)
+
+    if samples_seen != expected_samples:
+        raise RuntimeError(
+            f"Expected {expected_samples} samples, "
+            f"but processed {samples_seen}."
+        )
+
+    print(
+        f"{'Training' if training else 'Evaluation'}: "
+        f"processed {samples_seen}/{expected_samples} samples "
+        f"in {batch_count} batches"
+    )
 
     class_scores = []
 
@@ -220,6 +237,97 @@ def evaluate_test(model, test_loader, device):
 
     return patient_scores
 
+def evaluate_validation(model, loader, loss_fn, device):
+    """Evaluate full validation volumes and calculate patient-level Dice."""
+    model.eval()
+
+    patient_stats = {}
+    loss_sum = 0.0
+    volume_count = 0
+
+    with torch.inference_mode():
+        for index, (images, targets) in enumerate(loader):
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            if images.shape[0] != 1:
+                raise ValueError(
+                    "Full-volume validation requires batch_size=1."
+                )
+
+            image_path = loader.dataset.pairs[index][0]
+            pid = image_path.name.split("_")[0]
+
+            _, _, d, h, w = images.shape
+
+            # Pad dimensions to multiples of 16 for the 3D U-Net.
+            pd = (-d) % 16
+            ph = (-h) % 16
+            pw = (-w) % 16
+
+            if pd or ph or pw:
+                images = F.pad(
+                    images,
+                    (0, pw, 0, ph, 0, pd),
+                    mode="replicate",
+                )
+
+            logits = model(images)
+
+            # Remove padding so predictions match the original target.
+            logits = logits[:, :, :d, :h, :w]
+
+            loss = loss_fn(logits, targets)
+            loss_sum += loss.item()
+            volume_count += 1
+
+            predictions = logits.argmax(dim=1)
+
+            if pid not in patient_stats:
+                patient_stats[pid] = {
+                    "intersection": np.zeros(NUM_CLASSES),
+                    "denominator": np.zeros(NUM_CLASSES),
+                }
+
+            stats = patient_stats[pid]
+
+            for c in range(1, NUM_CLASSES):
+                pred_mask = predictions == c
+                target_mask = targets == c
+
+                stats["intersection"][c] += (
+                    pred_mask & target_mask
+                ).sum().item()
+
+                stats["denominator"][c] += (
+                    pred_mask.sum().item()
+                    + target_mask.sum().item()
+                )
+
+    if volume_count == 0:
+        raise ValueError("Validation loader contains no volumes.")
+
+    patient_scores = []
+
+    for stats in patient_stats.values():
+        class_scores = []
+
+        for c in range(1, NUM_CLASSES):
+            denom = stats["denominator"][c]
+
+            if denom > 0:
+                class_scores.append(
+                    2.0 * stats["intersection"][c] / denom
+                )
+
+        if class_scores:
+            patient_scores.append(float(np.mean(class_scores)))
+
+    if not patient_scores:
+        raise ValueError("No foreground Dice scores could be calculated.")
+
+    return loss_sum / volume_count, float(np.mean(patient_scores))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -291,6 +399,43 @@ def main():
     if not test_pairs:
         raise ValueError("No test volumes matched the test IDs.")
 
+    # Verify that every discovered MRI volume appears in exactly one split.
+    all_pairs = train_pairs + val_pairs + test_pairs
+
+    all_image_paths = [str(pair[0]) for pair in all_pairs]
+    expected_image_paths = {str(image) for image in images}
+
+    assert len(all_image_paths) == len(set(all_image_paths)), (
+        "Duplicate MRI volumes found across splits!"
+    )
+
+    assert set(all_image_paths) == expected_image_paths, (
+        "Some MRI volumes are missing from the splits, "
+        "or unexpected volumes have been included!"
+    )
+
+    # Verify patient-level split integrity.
+    def pair_patient_id(pair):
+        return pair[0].name.split("_")[0]
+
+    for name, pairs, allowed_ids in [
+        ("Training", train_pairs, train_ids),
+        ("Validation", val_pairs, val_ids),
+        ("Test", test_pairs, test_ids),
+    ]:
+        actual_ids = {pair_patient_id(pair) for pair in pairs}
+
+        assert actual_ids <= set(allowed_ids), (
+            f"{name} contains patients assigned to another split!"
+        )
+
+        print(
+            f"{name}: {len(pairs)} unique MRI volumes, "
+            f"{len(actual_ids)} patients"
+        )
+
+    print("All MRI volumes assigned exactly once.")
+
     print("\n========== DATASET SPLIT ==========")
     print(f"Training patients:   {len(train_ids)}")
     print(f"Validation patients: {len(val_ids)}")
@@ -309,7 +454,7 @@ def main():
     )
     val_ds = MRI3DVolumeDataset(
         *zip(*val_pairs),
-        patch_size=tuple(args.patch_size),
+        patch_size=None,
     )
     test_ds = MRI3DVolumeDataset(
         *zip(*test_pairs),
@@ -331,8 +476,10 @@ def main():
     )
     val_loader = DataLoader(
         val_ds,
+        batch_size=1,
         shuffle=False,
-        **common_loader_args,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
     )
     test_loader = DataLoader(
         test_ds,
@@ -405,7 +552,7 @@ def main():
             )
 
             # Validation.
-            val_loss, val_dice = epoch(
+            val_loss, val_dice = evaluate_validation(
                 model,
                 val_loader,
                 loss_fn,
