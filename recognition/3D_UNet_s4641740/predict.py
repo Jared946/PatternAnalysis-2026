@@ -1,6 +1,8 @@
 """Sliding-window prediction of full HipMRI volumes with UNet3D."""
 from __future__ import annotations
 import argparse
+import time
+import csv
 from pathlib import Path
 import nibabel as nib
 import numpy as np
@@ -67,14 +69,80 @@ def main():
     model.load_state_dict(ckpt['model_state'])
     model.to(device).eval()
     a.output_dir.mkdir(parents = True, exist_ok = True)
+
+    metrics = []
     for path in paths:
         nii = nib.load(str(path))
-        labels = predict(model, nii.dataobj, tuple(a.patch_size), device)
-        stem = path.name[:-7] if path.name.endswith('.nii.gz') else path.stem
-        output = a.output_dir / f'{stem}_segmentation_3d.nii.gz'
-        nib.save(nib.Nifti1Image(labels, nii.affine, nii.header), str(output))
-        print(f'Saved {output}')
+
+        # Make sure previous CUDA work has finished before timing.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+
+        # Time prediction only, excluding model loading and file saving.
+        start_time = time.perf_counter()
+
+        labels = predict(
+            model,
+            nii.dataobj,
+            tuple(a.patch_size),
+            device,
+        )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        inference_seconds = time.perf_counter() - start_time
+
+        # Read peak memory usage for this MRI volume.
+        if device.type == "cuda":
+            peak_allocated_gib = (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            )
+            peak_reserved_gib = (
+                torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+            )
+        else:
+            peak_allocated_gib = None
+            peak_reserved_gib = None
+
+        # Save prediction as before.
+        stem = (
+            path.name[:-7]
+            if path.name.endswith(".nii.gz")
+            else path.stem
+        )
+        output = a.output_dir / f"{stem}_segmentation_3d.nii.gz"
+
+        nib.save(
+            nib.Nifti1Image(labels, nii.affine, nii.header),
+            str(output),
+        )
+
+        metrics.append({
+            "case": stem,
+            "inference_seconds": inference_seconds,
+            "peak_gpu_allocated_GiB": peak_allocated_gib,
+            "peak_gpu_reserved_GiB": peak_reserved_gib,
+            "prediction_file": str(output),
+        })
+
+        print(f"Saved {output}")
+        print(f"  Inference time: {inference_seconds:.2f} seconds")
+
+        if peak_allocated_gib is not None:
+            print(f"  Peak allocated VRAM: {peak_allocated_gib:.3f} GiB")
+            print(f"  Peak reserved VRAM:  {peak_reserved_gib:.3f} GiB")
+
+    # Write one row per MRI volume to a CSV file.
+    metrics_path = a.output_dir / "inference_metrics.csv"
+
+    with metrics_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=metrics[0].keys())
+        writer.writeheader()
+        writer.writerows(metrics)
+
+    print(f"\nInference metrics saved to: {metrics_path.resolve()}")
 
 if __name__=='__main__':
     main()
-
