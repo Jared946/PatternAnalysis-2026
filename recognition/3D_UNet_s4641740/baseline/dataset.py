@@ -201,7 +201,6 @@ class MRI2DSliceDataset(Dataset):
         mask_tensor = (
             torch.from_numpy(to_channels(mask).copy())
             .permute(2, 0, 1)
-            .float()
         )
 
         return image_tensor, mask_tensor
@@ -226,7 +225,7 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
 
     Returns:
         image: float32 tensor [1, H, W]
-        target: long tensor [H, W] containing class IDs
+        target: uint8 one-hot tensor [6, H, W]
     """
 
     def __init__(self, *args, random_crop=False, **kwargs):
@@ -236,8 +235,7 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
     def __getitem__(self, index):
         image, one_hot_mask = super().__getitem__(index)
 
-        # CrossEntropyLoss expects integer class IDs, not one-hot masks.
-        target = one_hot_mask.argmax(dim=0).to(dtype=torch.long)
+        target = one_hot_mask
 
         height, width = image.shape[-2:]
         crop_height = paper_unet_size(height)
@@ -253,13 +251,14 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
             top = max_top // 2
             left = max_left // 2
 
-        return (
-            image[
-                ..., top:top + crop_height,
-                left:left + crop_width
-            ].contiguous(),
-            target[
-                top:top + crop_height,
-                left:left + crop_width
-            ].contiguous(),
-        )
+        image = image[
+            ..., top:top + crop_height,
+            left:left + crop_width
+        ]
+
+        target = target[
+            :, top:top + crop_height,
+            left:left + crop_width
+        ]
+
+        return image.contiguous(), target.contiguous()

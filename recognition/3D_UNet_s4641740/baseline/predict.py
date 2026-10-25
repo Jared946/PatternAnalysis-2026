@@ -41,6 +41,12 @@ def predict_volume(
     if volume.ndim != 3:
         raise ValueError(f"Expected a 3-D MRI volume, got {volume.shape}")
 
+    # Normalise the entire volume before extracting slices.
+    volume = volume.astype(np.float32, copy=False)
+    volume = (
+        volume - volume.mean()
+    ) / (volume.std() + 1e-8)
+
     height, width, depth = volume.shape
 
     crop_height = paper_unet_size(height)
@@ -54,7 +60,7 @@ def predict_volume(
     with torch.inference_mode():
         for slice_idx in range(depth):
             # Normalise the complete slice, matching the training dataset.
-            image = normalise_slice(volume[:, :, slice_idx])
+            image = volume[:, :, slice_idx]
 
             # Apply the same central input crop as the training dataset.
             image = image[
@@ -126,8 +132,14 @@ def main():
         nifti = nib.load(str(image_path))
         prediction = predict_volume(model, np.asarray(nifti.dataobj), device)
         output_path = args.output_dir / output_name(image_path)
-        nib.save(nib.Nifti1Image(prediction, nifti.affine, nifti.header),
-                str(output_path))
+
+        header = nifti.header.copy()
+        header.set_data_dtype(np.uint8)
+
+        nib.save(
+            nib.Nifti1Image(prediction, nifti.affine, header),
+            str(output_path),
+        )
         print(f"Saved {output_path}")
 
 

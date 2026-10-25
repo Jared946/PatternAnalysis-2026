@@ -19,7 +19,6 @@ from torch.utils.data import DataLoader
 
 from dataset import (
     PaperUNetMRI2DSliceDataset,
-    PaperUNetPreSlicedDataset,
     get_image_names,
     get_label_names,
     get_patient_ids,
@@ -82,14 +81,17 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
+        # Convert one-hot masks [N, 6, H, W] to class IDs [N, H, W].
+        target_ids = targets.argmax(dim=1).long()
+
         with torch.set_grad_enabled(training):
             logits = model(images)
 
-            # Targets are already integer class IDs: [N, H, W].
-            # Centre-crop them to match the valid-convolution output.
-            targets = crop_mask_to_logits(targets, logits)
+            # The U-Net uses valid convolutions, so align the target
+            # with the smaller output dimensions.
+            target_ids = crop_mask_to_logits(target_ids, logits)
 
-            loss = criterion(logits, targets)
+            loss = criterion(logits, target_ids)
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -98,10 +100,11 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 
         total_loss += loss.item()
         total_dice += mean_foreground_dice(
-            logits.detach(), targets
+            logits.detach(), target_ids
         )
 
     return total_loss / len(loader), total_dice / len(loader)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -155,12 +158,12 @@ def main():
             args.batch_size,
             shuffle=True,
             num_workers=args.workers,
-            pin_memory=True)
+            pin_memory=pin_memory)
     validation_loader = DataLoader(validation_dataset,
             args.batch_size,
             shuffle=False,
             num_workers=args.workers,
-            pin_memory=True)
+            pin_memory=pin_memory)
 
     model = PaperUNet2D(in_channels=1, num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(
