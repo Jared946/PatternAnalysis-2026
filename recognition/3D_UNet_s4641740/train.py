@@ -22,13 +22,87 @@ from modules import UNet3D
 
 NUM_CLASSES = 6
 
+class CrossEntropyDiceLoss(nn.Module):
+    """Cross-entropy plus multiclass soft Dice loss.
+
+    Input targets are one-hot masks with shape [N,C,D,H,W].
+    Cross-entropy uses recovered integer IDs; Dice uses one-hot masks.
+    Background class 0 is excluded from the Dice component.
+    """
+
+    def __init__(
+        self,
+        num_classes=NUM_CLASSES,
+        ce_weight=1.0,
+        dice_weight=1.0,
+        smooth=1e-6,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def forward(self, logits, targets_one_hot):
+        # logits:        [N,C,D,H,W]
+        # targets_one_hot: [N,C,D,H,W]
+
+        if logits.ndim != 5:
+            raise ValueError(
+                f"Expected 5-D logits, got {tuple(logits.shape)}"
+            )
+
+        if targets_one_hot.shape != logits.shape:
+            raise ValueError(
+                f"Expected one-hot targets shaped like logits; "
+                f"got targets={tuple(targets_one_hot.shape)}, "
+                f"logits={tuple(logits.shape)}"
+            )
+
+        # Recover integer class IDs for CrossEntropyLoss.
+        targets = targets_one_hot.argmax(dim=1).long()
+
+        ce = self.ce_loss(logits, targets)
+
+        # Use the dataset's one-hot encoding for Dice loss.
+        target_probs = targets_one_hot.to(dtype=logits.dtype)
+        probabilities = torch.softmax(logits, dim=1)
+
+        # Sum over batch and all spatial dimensions, per class.
+        dims = (0, 2, 3, 4)
+
+        intersection = (
+            probabilities * target_probs
+        ).sum(dim=dims)
+
+        denominator = (
+            probabilities + target_probs
+        ).sum(dim=dims)
+
+        dice_per_class = (
+            2.0 * intersection + self.smooth
+        ) / (
+            denominator + self.smooth
+        )
+
+        dice_loss = 1.0 - dice_per_class[1:].mean()
+
+        return (
+            self.ce_weight * ce
+            + self.dice_weight * dice_loss
+        )
+
 def dice(logits, target):
     """Calculate mean foreground Dice for one batch.
 
-    Background (class 0) is excluded. A class absent from both
-    prediction and target is excluded from the mean.
+    Accepts integer targets [N,D,H,W] or one-hot targets
+    [N,C,D,H,W]. Background is excluded.
     """
     prediction = logits.argmax(dim=1)
+
+    if target.ndim == logits.ndim:
+        target = target.argmax(dim=1)
     scores = []
     for c in range(1, NUM_CLASSES):
         pred_mask = prediction == c
@@ -66,6 +140,9 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
+            # Convert one-hot masks to integer IDs for hard Dice metrics.
+            target_ids = targets.argmax(dim=1)
+
             logits = model(images)
             loss = loss_fn(logits, targets)
 
@@ -81,7 +158,7 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
 
             for c in range(1, NUM_CLASSES):
                 pred_mask = predictions == c
-                target_mask = targets == c
+                target_mask = target_ids == c
 
                 intersections[c] += (
                     pred_mask & target_mask
@@ -143,6 +220,9 @@ def evaluate_test(model, test_loader, device):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
+            # Convert the one-hot ground truth for class-wise Dice metrics.
+            target_ids = targets.argmax(dim=1)
+
             # Batch size must be 1 because full volumes can differ in size.
             if images.shape[0] != 1:
                 raise ValueError(
@@ -184,7 +264,7 @@ def evaluate_test(model, test_loader, device):
 
             for c in range(1, NUM_CLASSES):
                 pred_mask = predictions == c
-                target_mask = targets == c
+                target_mask = target_ids == c
 
                 stats["intersection"][c] += (
                     pred_mask & target_mask
@@ -250,6 +330,9 @@ def evaluate_validation(model, loader, loss_fn, device):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
+            # Integer IDs are used for hard Dice evaluation.
+            target_ids = targets.argmax(dim=1)
+
             if images.shape[0] != 1:
                 raise ValueError(
                     "Full-volume validation requires batch_size=1."
@@ -293,7 +376,7 @@ def evaluate_validation(model, loader, loss_fn, device):
 
             for c in range(1, NUM_CLASSES):
                 pred_mask = predictions == c
-                target_mask = targets == c
+                target_mask = target_ids == c
 
                 stats["intersection"][c] += (
                     pred_mask & target_mask
@@ -491,7 +574,12 @@ def main():
 
     model = UNet3D(base_channels=args.base_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    loss_fn = nn.CrossEntropyLoss()
+
+    loss_fn = CrossEntropyDiceLoss(
+        num_classes=NUM_CLASSES,
+        ce_weight=1.0,
+        dice_weight=1.0,
+    ).to(device)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 

@@ -9,6 +9,19 @@ from torch.utils.data import Dataset
 
 NUM_CLASSES = 6
 
+def to_channels(arr: np.ndarray) -> np.ndarray:
+    """Convert integer labels [D,H,W] into one-hot [C,D,H,W].
+
+    Returns uint8 to keep the stored masks memory-efficient.
+    """
+    if not np.all(np.isin(arr, np.arange(NUM_CLASSES))):
+        raise ValueError("Segmentation contains labels outside 0-5.")
+
+    return np.stack(
+        [(arr == c) for c in range(NUM_CLASSES)],
+        axis=0,
+    ).astype(np.uint8)
+
 def get_image_names(root: Path):
     """Return sorted paths to MRI NIfTI volumes."""
     mri_folder = Path(root) / "semantic_MRs"
@@ -199,5 +212,7 @@ class MRI3DVolumeDataset(Dataset):
                 image[d:d+pd, h:h+ph, w:w+pw],
                 target[d:d+pd, h:h+ph, w:w+pw],
             )
-        return torch.from_numpy(image.copy()).unsqueeze(0),torch.from_numpy(target.copy()).long()
-
+        image_tensor = torch.from_numpy(image.copy()).unsqueeze(0)
+        # One-hot encode after any random patch crop has been applied.
+        target_one_hot = torch.from_numpy(to_channels(target.copy()))
+        return image_tensor, target_one_hot
