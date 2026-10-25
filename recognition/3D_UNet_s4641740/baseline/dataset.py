@@ -87,100 +87,54 @@ def split_patients(patient_ids):
 
 
 class MRI2DSliceDataset(Dataset):
-    """
-    Load 2D MRI slices and segmentation masks on demand.
+    """Lazy-loading 2D MRI slices with volume-level normalisation."""
 
-    Each item returns:
-        image: float32 tensor of shape (1, H, W)
-        mask: float32 one-hot tensor of shape (6, H, W)
-    """
+    def __init__(self, image_paths, label_paths, normalise=True):
+        if len(image_paths) != len(label_paths):
+            raise ValueError("Image and label counts do not match.")
 
-    def __init__(
-        self,
-        image_names,
-        label_names,
-        normalise=True,
-    ):
-        if len(image_names) != len(label_names):
-            raise ValueError(
-                "Number of MRI and segmentation files must match."
-            )
-
-        self.image_names = list(image_names)
-        self.label_names = list(label_names)
+        self.image_paths = [Path(p) for p in image_paths]
+        self.label_paths = [Path(p) for p in label_paths]
         self.normalise = normalise
 
-        # Index every 2D slice
+        # Keep lazy NIfTI proxies, not full image/mask arrays.
+        self.image_niis = []
+        self.label_niis = []
+        self.volume_stats = []
         self.slice_index = []
-        self.images = []
-        self.masks = []
 
         for volume_idx, (image_path, label_path) in enumerate(
-            zip(self.image_names, self.label_names)
+            zip(self.image_paths, self.label_paths)
         ):
-            if not label_path.exists():
-                raise FileNotFoundError(
-                    f"Missing segmentation: {label_path}"
-                )
-
             image_nii = nib.load(str(image_path))
             label_nii = nib.load(str(label_path))
 
             if image_nii.shape != label_nii.shape:
                 raise ValueError(
-                    f"Shape mismatch: {image_path.name}"
-                )
-
-            if len(image_nii.shape) != 3:
-                raise ValueError(
-                    f"Expected a 3D MRI: {image_path.name}"
+                    f"Shape mismatch for {image_path.name}: "
+                    f"{image_nii.shape} vs {label_nii.shape}"
                 )
 
             if not np.allclose(image_nii.affine, label_nii.affine):
                 raise ValueError(
-                    f"Affine mismatch: {image_path.name}"
+                    f"Affine mismatch for {image_path.name}"
                 )
 
-            # Load the entire volume into RAM
-            image_volume = np.asarray(
-                image_nii.dataobj, dtype=np.float32
-            )
-
-            # Validate the mask before converting its data type.
-            mask_raw = np.asarray(label_nii.dataobj)
-
-            if not np.all(np.isfinite(image_volume)):
-                raise ValueError(
-                    f"MRI contains non-finite values: {image_path.name}"
-                )
-
-            if not np.all(np.isfinite(mask_raw)):
-                raise ValueError(
-                    f"Mask contains non-finite values: {label_path.name}"
-                )
-
-            if not np.allclose(mask_raw, np.round(mask_raw)):
-                raise ValueError(
-                    f"Mask contains non-integer labels: {label_path.name}"
-                )
-
-            mask_rounded = np.round(mask_raw)
-
-            if not np.all(np.isin(mask_rounded, np.arange(6))):
-                raise ValueError(
-                    f"Mask contains labels outside 0-5: {label_path.name}"
-                )
-
-            mask_volume = mask_rounded.astype(np.int64)
-
-            # Normalise the complete volume
+            # Calculate the original volume-level normalisation statistics.
+            # Only one full image volume is temporarily materialised here.
             if self.normalise:
-                image_volume = (
-                    image_volume - image_volume.mean()
-                ) / (image_volume.std() + 1e-8)
+                volume = np.asarray(
+                    image_nii.dataobj, dtype=np.float32
+                )
+                mean = float(volume.mean())
+                std = float(volume.std())
+                del volume
+            else:
+                mean, std = 0.0, 1.0
 
-            self.images.append(image_volume)
-            self.masks.append(mask_volume)
+            self.image_niis.append(image_nii)
+            self.label_niis.append(label_nii)
+            self.volume_stats.append((mean, std))
 
             self.slice_index.extend(
                 (volume_idx, slice_idx)
@@ -193,18 +147,40 @@ class MRI2DSliceDataset(Dataset):
     def __getitem__(self, index):
         volume_idx, slice_idx = self.slice_index[index]
 
-        image = self.images[volume_idx][:, :, slice_idx]
-        mask = self.masks[volume_idx][:, :, slice_idx]
-
-        # PyTorch Conv2d expects (channels, height, width).
-        image_tensor = torch.from_numpy(image.copy()).unsqueeze(0)
-        mask_tensor = (
-            torch.from_numpy(to_channels(mask).copy())
-            .permute(2, 0, 1)
+        # Read only the requested 2D slices from disk.
+        image = np.asarray(
+            self.image_niis[volume_idx].dataobj[:, :, slice_idx],
+            dtype=np.float32,
+        )
+        mask_raw = np.asarray(
+            self.label_niis[volume_idx].dataobj[:, :, slice_idx]
         )
 
-        return image_tensor, mask_tensor
+        # Preserve volume-level normalisation, not per-slice normalisation.
+        if self.normalise:
+            mean, std = self.volume_stats[volume_idx]
+            image = (image - mean) / (std + 1e-8)
 
+        # Validate labels before converting them to compact uint8 IDs.
+        if not np.all(np.isfinite(mask_raw)):
+            raise ValueError("Mask contains non-finite values.")
+
+        mask_rounded = np.rint(mask_raw)
+
+        if not np.allclose(mask_raw, mask_rounded):
+            raise ValueError("Mask contains non-integer class labels.")
+
+        if not np.all(np.isin(mask_rounded, np.arange(6))):
+            raise ValueError("Segmentation contains labels outside 0-5.")
+
+        mask_ids = mask_rounded.astype(np.uint8)
+
+        image_tensor = torch.from_numpy(image.copy()).unsqueeze(0)
+        mask_tensor = torch.from_numpy(
+            to_channels(mask_ids).copy()
+        ).permute(2, 0, 1)
+
+        return image_tensor, mask_tensor
 
 def paper_unet_size(size: int) -> int:
     """Largest original-paper U-Net input size not greater than size."""

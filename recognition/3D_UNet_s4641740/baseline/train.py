@@ -28,9 +28,7 @@ from modules import PaperUNet2D, crop_mask_to_logits
 
 NUM_CLASSES = 6
 
-DATA_FOLDER = Path(
-        "/home/groups/comp3710/HipMRI_Study_open"
-        )
+DATA_FOLDER = Path("C:/Users/User/SEMESTER 2/COMP3710/project/HipMRI_Study_open")
 
 def patient_id(image_path: Path) -> str:
     """Extract patient ID from the MRI filename."""
@@ -111,12 +109,12 @@ def main():
     parser.add_argument("--data-root", type=Path, default=DATA_FOLDER)
     parser.add_argument("--output", type=Path,
             default=Path("checkpoints/unet2d_hipmri.pt"))
-    parser.add_argument("--epochs", type=int, default=1) #was 100
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int,
             default=1, help="All slices in a batch must have equal dimensions.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device",
             default="cuda" if torch.cuda.is_available() else "cpu")
@@ -155,15 +153,20 @@ def main():
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
             train_dataset,
-            args.batch_size,
+            batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.workers,
-            pin_memory=pin_memory)
-    validation_loader = DataLoader(validation_dataset,
-            args.batch_size,
+            num_workers=2,
+            pin_memory=pin_memory,
+            persistent_workers=True,
+            )
+    validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.batch_size,
             shuffle=False,
-            num_workers=args.workers,
-            pin_memory=pin_memory)
+            num_workers=2,
+            pin_memory=pin_memory,
+            persistent_workers=True,
+            )
 
     model = PaperUNet2D(in_channels=1, num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(

@@ -101,13 +101,13 @@ def output_name(image_path: Path) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--data-root", type=Path,
-            help="Directory containing semantic_MRs_anon.")
-    source.add_argument("--images", type=Path,
+    parser.add_argument("--data-root", type=Path,
+            default=Path('C:/Users/User/SEMESTER 2/COMP3710/project/HipMRI_Study_open'))
+    parser.add_argument("--images", type=Path,
             help="An MRI .nii.gz file or directory of MRI volumes.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path,
+                        default=Path('checkpoints/unet2d_hipmri.pt'))
+    parser.add_argument("--output-dir", type=Path, default=Path('inference/'))
     parser.add_argument("--device",
             default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
