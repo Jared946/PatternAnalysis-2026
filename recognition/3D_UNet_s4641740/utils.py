@@ -122,16 +122,22 @@ def print_dice(results):
     print("=" * 48)
 
 def display_case(mri, ground_truth, prediction, slice_index, key):
-    """Display MRI, ground truth, prediction, and boundary overlay."""
+    """Compare MRI, masks, exact-label errors and foreground errors."""
 
-    # Show one slice perpendicular to the third array axis.
-    image_slice = mri[:, :, slice_index]
-    gt_slice = ground_truth[:, :, slice_index]
-    pred_slice = prediction[:, :, slice_index]
+    image_slice = mri[:, :, slice_index].T
+    gt_slice = ground_truth[:, :, slice_index].T
+    pred_slice = prediction[:, :, slice_index].T
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    # True wherever the predicted class differs from the ground truth.
+    exact_errors = pred_slice != gt_slice
 
-    axes[0].imshow(image_slice.T, cmap="gray", origin="lower")
+    # True wherever foreground/background membership differs.
+    foreground_errors = (pred_slice > 0) != (gt_slice > 0)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.ravel()
+
+    axes[0].imshow(image_slice, cmap="gray", origin="lower")
     axes[0].set_title("Original MRI")
 
     label_cmap = ListedColormap([
@@ -139,55 +145,55 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
     ])
 
     axes[1].imshow(
-        gt_slice.T,
-        cmap=label_cmap,
-        vmin=0,
-        vmax=NUM_CLASSES - 1,
-        interpolation="nearest",
-        origin="lower",
+        gt_slice, cmap=label_cmap,
+        vmin=0, vmax=NUM_CLASSES - 1,
+        interpolation="nearest", origin="lower"
     )
     axes[1].set_title("Ground Truth")
 
     axes[2].imshow(
-        pred_slice.T,
-        cmap=label_cmap,
-        vmin=0,
-        vmax=NUM_CLASSES - 1,
-        interpolation="nearest",
-        origin="lower",
+        pred_slice, cmap=label_cmap,
+        vmin=0, vmax=NUM_CLASSES - 1,
+        interpolation="nearest", origin="lower"
     )
     axes[2].set_title("Prediction")
 
-    # Display MRI with ground-truth and prediction boundaries.
-    axes[3].imshow(image_slice.T, cmap="gray", origin="lower")
+    # Black = exact label match; white = any label mismatch.
+    axes[3].imshow(
+        exact_errors, cmap="gray",
+        vmin=0, vmax=1, interpolation="nearest", origin="lower"
+    )
+    axes[3].set_title(
+        f"Exact-label errors: {exact_errors.sum()} voxels"
+    )
 
-    gt_foreground = (gt_slice > 0).T
-    pred_foreground = (pred_slice > 0).T
+    # Only counts disagreement between foreground and background.
+    axes[4].imshow(
+        foreground_errors, cmap="gray",
+        vmin=0, vmax=1, interpolation="nearest", origin="lower"
+    )
+    axes[4].set_title(
+        f"Foreground errors: {foreground_errors.sum()} voxels"
+    )
 
-    if gt_foreground.any():
-        axes[3].contour(
-            gt_foreground.astype(float),
-            levels=[0.5],
-            colors=["lime"],
-            linewidths=1.2,
-        )
-
-    if pred_foreground.any():
-        axes[3].contour(
-            pred_foreground.astype(float),
-            levels=[0.5],
-            colors=["red"],
-            linewidths=1.2,
-        )
-
-    axes[3].set_title("Overlay: GT green, prediction red")
+    # MRI with exact-label errors highlighted in white.
+    axes[5].imshow(image_slice, cmap="gray", origin="lower")
+    error_overlay = np.ma.masked_where(
+        ~exact_errors, exact_errors.astype(float)
+    )
+    axes[5].imshow(
+        error_overlay, cmap="gray",
+        vmin=0, vmax=1, alpha=0.9,
+        interpolation="nearest", origin="lower"
+    )
+    axes[5].set_title("MRI + errors in white")
 
     for ax in axes:
         ax.set_axis_off()
 
     fig.suptitle(
         f"{key} | Slice {slice_index}/{mri.shape[2] - 1}",
-        fontsize=14,
+        fontsize=14
     )
     plt.tight_layout()
     plt.show()
