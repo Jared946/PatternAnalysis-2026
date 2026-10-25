@@ -187,7 +187,8 @@ class MRI3DVolumeDataset(Dataset):
                 dtype=np.int64).transpose(2, 0, 1)
         if not np.isin(target, np.arange(NUM_CLASSES)).all():
             raise ValueError(f"Invalid label in {label_path.name}")
-        image = (image - image.mean()) / (image.std() + 1e-8)
+        if (self.normalise):
+            image = (image - image.mean()) / (image.std() + 1e-8)
         if self.patch_size:
             image, target = _pad(image, target, self.patch_size)
             starts = [random.randint(0, n - p) if self.random_patch else
