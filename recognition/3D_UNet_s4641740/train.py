@@ -391,6 +391,9 @@ def evaluate_validation(model, loader, loss_fn, device):
         raise ValueError("Validation loader contains no volumes.")
 
     patient_scores = []
+    per_class_patient_scores = {
+        c: [] for c in range(1, NUM_CLASSES)
+    }
 
     for stats in patient_stats.values():
         class_scores = []
@@ -399,9 +402,12 @@ def evaluate_validation(model, loader, loss_fn, device):
             denom = stats["denominator"][c]
 
             if denom > 0:
-                class_scores.append(
+                class_dice = (
                     2.0 * stats["intersection"][c] / denom
                 )
+
+                class_scores.append(class_dice)
+                per_class_patient_scores[c].append(class_dice)
 
         if class_scores:
             patient_scores.append(float(np.mean(class_scores)))
@@ -409,7 +415,20 @@ def evaluate_validation(model, loader, loss_fn, device):
     if not patient_scores:
         raise ValueError("No foreground Dice scores could be calculated.")
 
-    return loss_sum / volume_count, float(np.mean(patient_scores))
+    per_class_dice = {
+        c: (
+            float(np.mean(scores))
+            if scores
+            else 0.0
+        )
+        for c, scores in per_class_patient_scores.items()
+    }
+
+    return (
+        loss_sum / volume_count,
+        float(np.mean(patient_scores)),
+        per_class_dice,
+    )
 
 
 def main():
@@ -640,7 +659,7 @@ def main():
             )
 
             # Validation.
-            val_loss, val_dice = evaluate_validation(
+            val_loss, val_dice, val_class_dice = evaluate_validation(
                 model,
                 val_loader,
                 loss_fn,
@@ -702,6 +721,11 @@ def main():
             print(f"  Training Dice:       {train_dice:.4f}")
             print(f"  Validation loss:     {val_loss:.4f}")
             print(f"  Validation Dice:     {val_dice:.4f}")
+            for c in range(1, NUM_CLASSES):
+                print(
+                    f"  Validation class {c} Dice: "
+                    f"{val_class_dice[c]:.4f}"
+                )
             print(f"  Best validation Dice:{best_val_dice: .4f}")
             print(f"  Epoch runtime:       {epoch_seconds:.2f} seconds")
 
