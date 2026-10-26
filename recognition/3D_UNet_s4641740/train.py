@@ -23,10 +23,9 @@ from modules import UNet3D
 NUM_CLASSES = 6
 
 class CrossEntropyDiceLoss(nn.Module):
-    """Cross-entropy plus multiclass soft Dice loss.
+    """Class-weighted cross-entropy plus multiclass soft Dice loss.
 
-    Input targets are one-hot masks with shape [N,C,D,H,W].
-    Cross-entropy uses recovered integer IDs; Dice uses one-hot masks.
+    Input targets are one-hot masks shaped [N,C,D,H,W].
     Background class 0 is excluded from the Dice component.
     """
 
@@ -35,6 +34,7 @@ class CrossEntropyDiceLoss(nn.Module):
         num_classes=NUM_CLASSES,
         ce_weight=1.0,
         dice_weight=1.0,
+        class_weights=None,
         smooth=1e-6,
     ):
         super().__init__()
@@ -42,12 +42,20 @@ class CrossEntropyDiceLoss(nn.Module):
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
         self.smooth = smooth
-        self.ce_loss = nn.CrossEntropyLoss()
+
+        if class_weights is not None:
+            class_weights = torch.as_tensor(
+                class_weights, dtype=torch.float32
+            )
+            if class_weights.numel() != num_classes:
+                raise ValueError(
+                    f"Expected {num_classes} class weights, "
+                    f"got {class_weights.numel()}"
+                )
+
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
 
     def forward(self, logits, targets_one_hot):
-        # logits:        [N,C,D,H,W]
-        # targets_one_hot: [N,C,D,H,W]
-
         if logits.ndim != 5:
             raise ValueError(
                 f"Expected 5-D logits, got {tuple(logits.shape)}"
@@ -55,21 +63,19 @@ class CrossEntropyDiceLoss(nn.Module):
 
         if targets_one_hot.shape != logits.shape:
             raise ValueError(
-                f"Expected one-hot targets shaped like logits; "
+                f"Expected targets shaped like logits; "
                 f"got targets={tuple(targets_one_hot.shape)}, "
                 f"logits={tuple(logits.shape)}"
             )
 
-        # Recover integer class IDs for CrossEntropyLoss.
+        # Cross-entropy uses integer class IDs.
         targets = targets_one_hot.argmax(dim=1).long()
-
         ce = self.ce_loss(logits, targets)
 
-        # Use the dataset's one-hot encoding for Dice loss.
+        # Soft Dice uses probabilities and one-hot targets.
         target_probs = targets_one_hot.to(dtype=logits.dtype)
         probabilities = torch.softmax(logits, dim=1)
 
-        # Sum over batch and all spatial dimensions, per class.
         dims = (0, 2, 3, 4)
 
         intersection = (
@@ -92,6 +98,64 @@ class CrossEntropyDiceLoss(nn.Module):
             self.ce_weight * ce
             + self.dice_weight * dice_loss
         )
+
+def calculate_class_weights(train_pairs, num_classes=NUM_CLASSES):
+    """Calculate moderate inverse-square-root class weights
+    from training ground-truth volumes only.
+    """
+    voxel_counts = np.zeros(num_classes, dtype=np.int64)
+
+    for _, label_path in train_pairs:
+        label_img = nib.load(str(label_path))
+        labels = np.asarray(label_img.dataobj)
+
+        if not np.all(np.isfinite(labels)):
+            raise ValueError(f"Non-finite labels in {label_path}")
+
+        rounded = np.rint(labels)
+
+        if not np.allclose(labels, rounded):
+            raise ValueError(
+                f"Non-integer class labels found in {label_path}"
+            )
+
+        labels = rounded.astype(np.int64)
+
+        if labels.min() < 0 or labels.max() >= num_classes:
+            raise ValueError(
+                f"Unexpected label IDs in {label_path}: "
+                f"{np.unique(labels)}"
+            )
+
+        voxel_counts += np.bincount(
+            labels.ravel(), minlength=num_classes
+        )
+
+    if np.any(voxel_counts == 0):
+        raise ValueError(
+            f"At least one class is absent from training masks: "
+            f"{voxel_counts.tolist()}"
+        )
+
+    frequencies = voxel_counts / voxel_counts.sum()
+
+    # Inverse-square-root weighting.
+    weights = 1.0 / np.sqrt(frequencies)
+
+    # Normalise to mean 1, then limit extreme class weights.
+    weights = weights / weights.mean()
+    weights = np.minimum(weights, 5.0)
+
+    print("\nTraining-set class frequencies and weights:")
+    for c in range(num_classes):
+        print(
+            f"  Class {c}: "
+            f"voxels={voxel_counts[c]:,}, "
+            f"frequency={frequencies[c]:.6f}, "
+            f"weight={weights[c]:.4f}"
+        )
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 def dice(logits, target):
     """Calculate mean foreground Dice for one batch.
@@ -457,7 +521,7 @@ def main():
         default=16,
         help="Base channel width; 16 is a practical starting point for 3D.",
     )
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=1)
@@ -594,10 +658,13 @@ def main():
     model = UNet3D(base_channels=args.base_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    class_weights = calculate_class_weights(train_pairs)
+
     loss_fn = CrossEntropyDiceLoss(
         num_classes=NUM_CLASSES,
         ce_weight=1.0,
         dice_weight=1.0,
+        class_weights=class_weights,
     ).to(device)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -794,4 +861,3 @@ def main():
 
 if __name__=='__main__':
     main()
-
