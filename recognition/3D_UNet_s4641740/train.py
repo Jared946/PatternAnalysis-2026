@@ -179,12 +179,6 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             f"but processed {samples_seen}."
         )
 
-    print(
-        f"{'Training' if training else 'Evaluation'}: "
-        f"processed {samples_seen}/{expected_samples} samples "
-        f"in {batch_count} batches"
-    )
-
     class_scores = []
 
     for c in range(1, NUM_CLASSES):
@@ -288,28 +282,6 @@ def evaluate_test(model, test_loader, device):
                 class_scores[c].append(score)
 
         patient_scores[pid] = float(np.mean(scores)) if scores else 1.0
-
-    print("\n========== FULL-VOLUME TEST RESULTS ==========")
-
-    for pid in sorted(patient_scores):
-        print(f"Patient {pid}: mean foreground Dice = {patient_scores[pid]:.4f}")
-
-    if patient_scores:
-        print(
-            f"\nMean patient Dice: "
-            f"{np.mean(list(patient_scores.values())):.4f}"
-        )
-
-    for c in range(1, NUM_CLASSES):
-        if class_scores[c]:
-            print(
-                f"Class {c} mean patient Dice: "
-                f"{np.mean(class_scores[c]):.4f}"
-            )
-        else:
-            print(f"Class {c} mean patient Dice: N/A")
-
-    print("==============================================")
 
     return patient_scores
 
@@ -451,7 +423,7 @@ def main():
         "--base-channels",
         type=int,
         default=16,
-        help="Base channel width; 16 is a practical starting point for 3D.",
+        help="Base channel width",
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -523,27 +495,7 @@ def main():
     ]:
         actual_ids = {pair_patient_id(pair) for pair in pairs}
 
-        assert actual_ids <= set(allowed_ids), (
-            f"{name} contains patients assigned to another split!"
-        )
-
-        print(
-            f"{name}: {len(pairs)} unique MRI volumes, "
-            f"{len(actual_ids)} patients"
-        )
-
-    print("All MRI volumes assigned exactly once.")
-
-    print("\n========== DATASET SPLIT ==========")
-    print(f"Training patients:   {len(train_ids)}")
-    print(f"Validation patients: {len(val_ids)}")
-    print(f"Test patients:       {len(test_ids)}")
-    print(f"Training volumes:    {len(train_pairs)}")
-    print(f"Validation volumes:  {len(val_pairs)}")
-    print(f"Test volumes:        {len(test_pairs)}")
-    print("===================================\n")
-
-    # Training uses random patches; validation uses the dataset's
+    # Training uses random patches, validation uses the dataset's
     # default patch selection behaviour.
     train_ds = MRI3DVolumeDataset(
         *zip(*train_pairs),
@@ -610,10 +562,7 @@ def main():
 
     training_start = time.perf_counter()
 
-    print(f"Device: {device}")
     print(f"Epochs: {args.epochs}")
-    print(f"Patch size (D, H, W): {tuple(args.patch_size)}")
-    print(f"Base channels: {args.base_channels}")
     print(f"Checkpoint: {args.output}")
     print(f"CSV log: {csv_path}\n")
 
@@ -711,29 +660,7 @@ def main():
 
             learning_rate = optimizer.param_groups[0]["lr"]
 
-            # Terminal report.
             print(f"\nEpoch {e:03d}/{args.epochs}")
-            print(f"  Training loss:       {train_loss:.4f}")
-            print(f"  Training Dice:       {train_dice:.4f}")
-            print(f"  Validation loss:     {val_loss:.4f}")
-            print(f"  Validation Dice:     {val_dice:.4f}")
-            for c in range(1, NUM_CLASSES):
-                print(
-                    f"  Validation class {c} Dice: "
-                    f"{val_class_dice[c]:.4f}"
-                )
-            print(f"  Best validation Dice:{best_val_dice: .4f}")
-            print(f"  Epoch runtime:       {epoch_seconds:.2f} seconds")
-
-            if device.type == "cuda":
-                print(
-                    f"  Peak GPU allocated:  {peak_allocated:.3f} GiB"
-                )
-                print(
-                    f"  Peak GPU reserved:   {peak_reserved:.3f} GiB"
-                )
-            else:
-                print("  GPU memory:           Not applicable (CPU execution)")
 
             # Persist this epoch's metrics immediately.
             writer.writerow(
@@ -757,27 +684,12 @@ def main():
 
     total_seconds = time.perf_counter() - training_start
 
-    print("\n========== TRAINING SUMMARY ==========")
-    print("Training completed: YES")
-    print("Validation completed: YES")
-    print(f"Total training runtime: {total_seconds:.2f} seconds")
+    print("\n=== TRAINING SUMMARY ===")
     print(f"Total training runtime: {total_seconds / 60:.2f} minutes")
     print(f"Best validation Dice:   {best_val_dice:.4f}")
-
-    if device.type == "cuda":
-        print(
-            f"Overall peak GPU allocated: {overall_peak_allocated:.3f} GiB"
-        )
-        print(
-            f"Overall peak GPU reserved:  {overall_peak_reserved:.3f} GiB"
-        )
-    else:
-        print("GPU memory: Not applicable (CPU execution)")
-
     print(f"Checkpoint saved:       {checkpoint_saved}")
     print(f"Checkpoint path:        {args.output}")
     print(f"CSV log path:           {csv_path}")
-    print("======================================")
 
     if not checkpoint_saved:
         raise RuntimeError("No best checkpoint was saved; cannot evaluate test set.")

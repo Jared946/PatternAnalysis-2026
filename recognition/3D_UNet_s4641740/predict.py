@@ -130,10 +130,6 @@ def main():
         print(f"Saved {output}")
         print(f"  Inference time: {inference_seconds:.2f} seconds")
 
-        if peak_allocated_gib is not None:
-            print(f"  Peak allocated VRAM: {peak_allocated_gib:.3f} GiB")
-            print(f"  Peak reserved VRAM:  {peak_reserved_gib:.3f} GiB")
-
     # Write one row per MRI volume to a CSV file.
     metrics_path = a.output_dir / "inference_metrics.csv"
 

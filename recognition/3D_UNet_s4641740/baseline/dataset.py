@@ -96,7 +96,7 @@ class MRI2DSliceDataset(Dataset):
         self.label_paths = [Path(p) for p in label_paths]
         self.normalise = normalise
 
-        # Keep lazy NIfTI proxies, not full image/mask arrays.
+        # Use lazy NIfTI proxies
         self.image_niis = []
         self.label_niis = []
         self.volume_stats = []

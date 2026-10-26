@@ -13,8 +13,6 @@ import nibabel as nib
 import numpy as np
 import torch
 
-#from dataset import get_image_names
-#from modules import UNet2D
 from dataset import get_image_names, paper_unet_size
 from modules import PaperUNet2D
 

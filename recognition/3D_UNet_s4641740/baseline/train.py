@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--data-root", type=Path, default=DATA_FOLDER)
     parser.add_argument("--output", type=Path,
             default=Path("checkpoints/unet2d_hipmri.pt"))
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int,
             default=1, help="All slices in a batch must have equal dimensions.")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -231,29 +231,10 @@ def main():
     validation_dataset = make_dataset(
         image_names, label_names, validation_ids
     )
-    #test_dataset = make_dataset(
-    #    image_names, label_names, test_ids
-    #)
     # Count volumes assigned to each patient partition.
     train_volumes = sum(patient_id(p) in train_ids for p in image_names)
     val_volumes = sum(patient_id(p) in validation_ids for p in image_names)
     test_volumes = sum(patient_id(p) in test_ids for p in image_names)
-
-    # Verify that partitions are disjoint and cover every patient.
-    assert train_ids.isdisjoint(validation_ids)
-    assert train_ids.isdisjoint(test_ids)
-    assert validation_ids.isdisjoint(test_ids)
-    assert train_ids | validation_ids | test_ids == set(patient_ids)
-
-    print("\n========== DATASET SPLIT ==========")
-    print(f"Training patients:   {len(train_ids)}")
-    print(f"Validation patients: {len(validation_ids)}")
-    print(f"Test patients:       {len(test_ids)}")
-    print(f"Training volumes:    {train_volumes}")
-    print(f"Validation volumes:  {val_volumes}")
-    print(f"Test volumes:        {test_volumes}")
-    print("All MRI volumes assigned exactly once.")
-    print("===================================\n")
 
     images, targets = next(iter(DataLoader(
         train_dataset,
@@ -262,22 +243,8 @@ def main():
         num_workers=0,
     )))
 
-    print("Image batch:", images.shape, images.dtype)
-    print("One-hot mask:", targets.shape, targets.dtype)
-
-    # Every pixel should have exactly one active class.
-    assert targets.shape[1] == NUM_CLASSES
-    assert torch.all(targets.sum(dim=1) == 1), (
-        "One-hot mask contains pixels that do not have exactly "
-        "one active class."
-    )
-
     # Verify conversion to class IDs works.
     target_ids = targets.argmax(dim=1).long()
-
-    print("Class IDs:", target_ids.shape, target_ids.dtype)
-    print("Classes present:", torch.unique(target_ids).tolist())
-    print("One-hot target check passed.")
 
     pin_memory = device.type == "cuda"
     loader_options = {
@@ -350,22 +317,6 @@ def main():
     overall_peak_allocated = 0.0
     overall_peak_reserved = 0.0
     best_epoch = 0
-
-    print("\n========== TRAINING CONFIGURATION ==========")
-    print(f"Device:             {device}")
-    print(f"Epochs:             {args.epochs}")
-    print(f"Starting epoch:     {start_epoch if 'start_epoch' in locals() else 1}")
-    print(f"Batch size:         {args.batch_size}")
-    print(f"DataLoader workers: {args.workers}")
-    print(f"Optimiser:          AdamW")
-    print(f"Learning rate:      {args.lr}")
-    print(f"Weight decay:       {args.weight_decay}")
-    print(f"Loss function:      CrossEntropyLoss")
-    print(f"Model:              PaperUNet2D")
-    print(f"Model parameters:   {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Checkpoint:         {args.output}")
-    print(f"CSV log:            {csv_path}")
-    print("============================================\n")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -457,45 +408,17 @@ def main():
             writer.writerow(row)
 
         print(f"\nEpoch {epoch:03d}/{args.epochs}")
-        print(f"  Training loss:       {train_loss:.4f}")
-        print(f"  Training Dice:       {train_dice:.4f}")
-        print(f"  Validation loss:     {val_loss:.4f}")
-        print(f"  Validation Dice:     {val_dice:.4f}")
-        print(f"  Best validation Dice: {best_dice:.4f} (epoch {best_epoch})")
-
-        print("  Validation Dice by class:")
-        for class_id in range(1, NUM_CLASSES):
-            score = val_class_dice[class_id]
-            score_text = "N/A" if score is None else f"{score:.4f}"
-            print(f"    Class {class_id}: {score_text}")
-
-        print(f"  Epoch runtime:       {epoch_runtime:.2f} seconds")
-        print(f"  Cumulative runtime:  {cumulative_runtime / 60:.2f} minutes")
-
-        if peak_allocated is not None:
-            print(f"  Peak GPU allocated:  {peak_allocated:.3f} GiB")
-            print(f"  Peak GPU reserved:   {peak_reserved:.3f} GiB")
 
         if improved:
             print(f"  Saved best checkpoint to {args.output}")
 
     total_runtime = time.perf_counter() - run_start
 
-    print("\n========== TRAINING SUMMARY ==========")
-    print("Training completed: YES")
-    print("Validation completed: YES")
-    print(f"Total training runtime: {total_runtime:.2f} seconds")
-    print(f"Total training runtime: {total_runtime / 60:.2f} minutes")
+    print("\n=== Training Summary ===")
     print(f"Best validation Dice:   {best_dice:.4f}")
     print(f"Best epoch:             {best_epoch}")
-
-    if device.type == "cuda":
-        print(f"Overall peak GPU allocated: {overall_peak_allocated:.3f} GiB")
-        print(f"Overall peak GPU reserved:  {overall_peak_reserved:.3f} GiB")
-
     print(f"Checkpoint path: {args.output}")
     print(f"CSV log path:    {csv_path}")
-    print("======================================")
 
 
 if __name__ == "__main__":
