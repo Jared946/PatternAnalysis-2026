@@ -4,6 +4,10 @@ The network intentionally uses *valid* (padding=0) 3x3 convolutions.  This
 matches ``phseg_v5-train.prototxt`` from the supplied u-net-release exactly:
 the prediction is therefore smaller than the input and decoder skip features
 are centre-cropped before concatenation.
+
+Adapted from: O. Ronneberger, P. Fischer, and T. Brox, “U-Net: Convolutional
+networks for biomedical image segmentation,” in Proc. MICCAI, 2015,
+pp. 234-241.
 """
 
 from __future__ import annotations

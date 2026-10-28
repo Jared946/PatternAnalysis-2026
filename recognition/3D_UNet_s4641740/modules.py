@@ -4,6 +4,10 @@ It retains two convolutions per level, 4 pools, 4 transpose-convolution
 upsamples, dropout, concatenated skips, and a 1x1 head.  Convolutions are
 padded because HipMRI depth is below the 188 voxels required by an all-valid
 3D U-Net.
+
+Adapted from Ö. Çiçek, A. Abdulkadir, S. S. Lienkamp, T. Brox, and O. Ronneberger,
+“3D U-Net: Learning dense volumetric segmentation from sparse annotation,”
+in Proc. MICCAI, 2016, pp. 424-432.
 """
 from __future__ import annotations
 import torch
