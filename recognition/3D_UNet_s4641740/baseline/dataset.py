@@ -7,7 +7,6 @@ import numpy as np
 import nibabel as nib
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
 from pathlib import Path
 
 # Geometry of the U-Net
@@ -17,6 +16,7 @@ UNET_REMAINDER = 12
 UNET_STRIDE = 2 ** POOLING_LEVELS
 
 def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
+    """Validate segmentation labels and convert to one-hot encoded channels."""
     valid_labels = np.isin(arr, np.arange(6))
     if not np.all(valid_labels):
         raise ValueError("Segmentation contains labels outside 0-5.")
@@ -43,6 +43,7 @@ def get_label_names(image_names, data_folder):
     """Find the segmentation volume matching each MRI."""
     label_folder = Path(data_folder) / "semantic_labels_only"
 
+    # Match MRI volumes to their corresponding segmentation files
     label_names = []
     for image_path in image_names:
         label_name = image_path.name.replace(
@@ -96,18 +97,20 @@ class MRI2DSliceDataset(Dataset):
         self.label_paths = [Path(p) for p in label_paths]
         self.normalise = normalise
 
-        # Use lazy NIfTI proxies
+        # Initialise lazy NIfTI proxies
         self.image_niis = []
         self.label_niis = []
         self.volume_stats = []
         self.slice_index = []
 
+        # Load volume metadata and prepare an index for each 2D slice
         for volume_idx, (image_path, label_path) in enumerate(
             zip(self.image_paths, self.label_paths)
         ):
             image_nii = nib.load(str(image_path))
             label_nii = nib.load(str(label_path))
 
+            # Check MRI volumes match their segmentations shape
             if image_nii.shape != label_nii.shape:
                 raise ValueError(
                     f"Shape mismatch for {image_path.name}: "
@@ -135,6 +138,7 @@ class MRI2DSliceDataset(Dataset):
             self.label_niis.append(label_nii)
             self.volume_stats.append((mean, std))
 
+            # Map each index to its corresponding volume and slice
             self.slice_index.extend(
                 (volume_idx, slice_idx)
                 for slice_idx in range(image_nii.shape[2])
@@ -144,6 +148,7 @@ class MRI2DSliceDataset(Dataset):
         return len(self.slice_index)
 
     def __getitem__(self, index):
+        """Retrieve the volume and slice corresponding to index."""
         volume_idx, slice_idx = self.slice_index[index]
 
         # Read only the requested 2D slices from disk.
@@ -174,6 +179,7 @@ class MRI2DSliceDataset(Dataset):
 
         mask_ids = mask_rounded.astype(np.uint8)
 
+        # Convert image and segmentation slices to PyTorch tensors
         image_tensor = torch.from_numpy(image.copy()).unsqueeze(0)
         mask_tensor = torch.from_numpy(
             to_channels(mask_ids).copy()
@@ -183,6 +189,7 @@ class MRI2DSliceDataset(Dataset):
 
 def paper_unet_size(size: int) -> int:
     """Largest original-paper U-Net input size not greater than size."""
+    # Compute largest valid dimension for U-Net cropping scheme
     legal_size = size - (
         (size - UNET_REMAINDER) % UNET_STRIDE
     )
@@ -208,10 +215,12 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
         self.random_crop = random_crop
 
     def __getitem__(self, index):
+        # Load image and one-hot segmentation mask
         image, one_hot_mask = super().__getitem__(index)
 
         target = one_hot_mask
 
+        # Compute valid input dimensions and crop boundaries
         height, width = image.shape[-2:]
         crop_height = paper_unet_size(height)
         crop_width = paper_unet_size(width)
@@ -219,6 +228,7 @@ class PaperUNetMRI2DSliceDataset(MRI2DSliceDataset):
         max_top = height - crop_height
         max_left = width - crop_width
 
+        # Apply same crop to MRI image and its segmentation mask
         if self.random_crop:
             top = random.randint(0, max_top)
             left = random.randint(0, max_left)

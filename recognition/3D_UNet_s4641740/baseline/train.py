@@ -47,7 +47,7 @@ class PerVolumeSliceSampler(Sampler):
         self.min_slice = min_slice
         self.max_slice = max_slice
 
-        # Group dataset indices by MRI volume.
+        # Group eligible dataset indices by their source MRI volume
         self.volume_indices = {}
 
         for dataset_idx, (volume_idx, slice_idx) in enumerate(
@@ -69,11 +69,12 @@ class PerVolumeSliceSampler(Sampler):
     def __iter__(self):
         selected = []
 
+        # Sample the same maximum number of slices from each volume
         for indices in self.volume_indices.values():
             count = min(self.slices_per_volume, len(indices))
             selected.extend(random.sample(indices, count))
 
-        # Shuffle the selected slices across volumes.
+        # Shuffle the selected slices across volumes
         random.shuffle(selected)
         return iter(selected)
 
@@ -83,16 +84,12 @@ class PerVolumeSliceSampler(Sampler):
             for indices in self.volume_indices.values()
         )
 
-
 def patient_id(image_path: Path) -> str:
     """Extract patient ID from the MRI filename."""
     return image_path.name.split("_")[0]
 
-def select_partition(image_names, label_names, wanted_ids):
-    return zip(*[(image, label) for image, label in zip(image_names, label_names)
-        if patient_id(image) in wanted_ids])
-
 def make_dataset(image_names, label_names, patient_ids):
+    # Select the MRI volumes assigned to this patient partition
     pairs = [
         (image, label)
         for image, label in zip(image_names, label_names)
@@ -104,6 +101,7 @@ def make_dataset(image_names, label_names, patient_ids):
 
     images, labels = zip(*pairs)
 
+    # Load slices lazily and apply the dataset's normalisation
     return PaperUNetMRI2DSliceDataset(
         images,
         labels,
@@ -111,21 +109,12 @@ def make_dataset(image_names, label_names, patient_ids):
         random_crop=False,
     )
 
-def mean_foreground_dice(logits: Tensor, target: Tensor) -> float:
-    """Mean Dice across HipMRI foreground classes 1--5 for one batch."""
-    prediction = logits.argmax(dim=1)
-    scores = []
-    for class_id in range(1, NUM_CLASSES):
-        predicted_class, target_class = prediction == class_id, target == class_id
-        denominator = predicted_class.sum().item() + target_class.sum().item()
-        if denominator:
-            scores.append(2.0 * (predicted_class & target_class).sum().item() / denominator)
-    return float(np.mean(scores)) if scores else 1.0
-
 def run_epoch(model, loader, criterion, device, optimizer=None):
+    # Supplying an optimizer enables training, otherwise run validation
     training = optimizer is not None
     model.train(training)
 
+    # Accumulate epoch metrics on the device to reduce synchronisation
     total_loss = torch.zeros((), device=device)
     total_dice = torch.zeros((), device=device)
     class_intersections = torch.zeros(NUM_CLASSES, device=device)
@@ -135,25 +124,30 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
+        # Convert one-hot segmentation masks into class-index targets
         target_ids = targets.argmax(dim=1).long()
 
         with torch.set_grad_enabled(training):
             logits = model(images)
+
             # The U-Net uses valid convolutions, so align the target
-            # with the smaller output dimensions.
+            # with the smaller output dimensions
             target_ids = crop_mask_to_logits(target_ids, logits)
             loss = criterion(logits, target_ids)
 
+            # Update model weights only during training
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
 
-        # Accumulate loss on the device; synchronise only after the epoch.
+        # Accumulate loss on the device, synchronise only after the epoch
         total_loss += loss.detach()
 
         predictions = logits.detach().argmax(dim=1)
 
+        # Calculate foreground Dice scores for this batch and accumulate
+        # intersections and denominators for the epoch-level class scores
         batch_scores = []
         for class_id in range(1, NUM_CLASSES):
             predicted_class = predictions == class_id
@@ -165,7 +159,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             class_intersections[class_id] += intersection
             class_denominators[class_id] += denominator
 
-            # Preserve the original batch-level Dice averaging behaviour.
+            # Preserve the original batch-level Dice averaging behaviour
             if denominator.item() > 0:
                 batch_scores.append(
                     2.0 * intersection.float() / denominator.float()
@@ -179,10 +173,11 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     if len(loader) == 0:
         raise ValueError("DataLoader contains no batches.")
 
+    # Calculate mean loss and Dice across all batches in the epoch
     mean_loss = (total_loss / len(loader)).item()
     mean_dice = (total_dice / len(loader)).item()
 
-    # Per-class Dice aggregated across all pixels in this epoch.
+    # Per-class Dice aggregated across all pixels in this epoch
     per_class_dice = {}
     for class_id in range(1, NUM_CLASSES):
         denominator = class_denominators[class_id].item()
@@ -197,6 +192,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     return mean_loss, mean_dice, per_class_dice
 
 def main():
+    # Configure training options and paths
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=DATA_FOLDER)
     parser.add_argument("--output", type=Path,
@@ -213,14 +209,17 @@ def main():
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
 
+    # Seed the random number generators for reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
+    # Discover MRI volumes and their corresponding segmentation labels
     image_names = get_image_names(args.data_root)
     label_names = get_label_names(image_names, args.data_root)
 
+    # Split by patient IDs
     patient_ids = get_patient_ids(image_names)
 
     train_ids, validation_ids, test_ids = split_patients(patient_ids)
@@ -231,21 +230,8 @@ def main():
     validation_dataset = make_dataset(
         image_names, label_names, validation_ids
     )
-    # Count volumes assigned to each patient partition.
-    train_volumes = sum(patient_id(p) in train_ids for p in image_names)
-    val_volumes = sum(patient_id(p) in validation_ids for p in image_names)
-    test_volumes = sum(patient_id(p) in test_ids for p in image_names)
 
-    images, targets = next(iter(DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-    )))
-
-    # Verify conversion to class IDs works.
-    target_ids = targets.argmax(dim=1).long()
-
+    # Configure data loading, using pinned memory when training on CUDA
     pin_memory = device.type == "cuda"
     loader_options = {
         "batch_size": args.batch_size,
@@ -254,6 +240,8 @@ def main():
         "persistent_workers": args.workers > 0,
     }
 
+    # Sample a fixed number of slices from the central region of each
+    # training volume during every epoch
     train_sampler = PerVolumeSliceSampler(
         train_dataset,
         slices_per_volume=16,
@@ -270,12 +258,14 @@ def main():
         persistent_workers=args.workers > 0,
     )
 
+    # Iterate through the complete validation dataset without shuffling
     validation_loader = DataLoader(
         validation_dataset,
         shuffle=False,
         **loader_options,
     )
 
+    # Initialise the model, optimiser and multi-class classification loss
     model = PaperUNet2D(in_channels=1, num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -283,6 +273,7 @@ def main():
             weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
 
+    # Restore model and optimiser state when continuing a previous run
     start_epoch, best_dice, best_epoch = 1, -float("inf"), 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -292,13 +283,14 @@ def main():
         best_dice = checkpoint.get("best_validation_dice", best_dice)
         best_epoch = checkpoint.get("epoch", 0)
 
-    # One CSV file alongside the checkpoint.
+    # One CSV file alongside the checkpoint
     csv_path = args.output.with_suffix(".csv")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If resuming, append to an existing log; otherwise start a fresh log.
+    # If resuming, append to an existing log, otherwise start a fresh log
     csv_mode = "a" if args.resume and csv_path.exists() else "w"
 
+    # Record aggregate and per-class metrics, runtime and GPU memory use
     csv_fields = [
         "epoch",
         "train_loss",
@@ -313,27 +305,28 @@ def main():
         "peak_gpu_reserved_gib",
     ]
 
-    start_time = time.perf_counter()
     overall_peak_allocated = 0.0
     overall_peak_reserved = 0.0
-    best_epoch = 0
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create a new CSV header if starting a fresh run.
+    # Create a new CSV header if starting a fresh run
     if csv_mode == "w" or not csv_path.exists() or csv_path.stat().st_size == 0:
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=csv_fields).writeheader()
 
+    # Track elapsed time for this training run
     run_start = time.perf_counter()
 
     for epoch in range(start_epoch, args.epochs + 1):
+        # Reset CUDA peak-memory measurements at the start of each epoch
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
 
         epoch_start = time.perf_counter()
 
+        # Train the model and then evaluate it on the validation set
         train_loss, train_dice, train_class_dice = run_epoch(
             model, train_loader, criterion, device, optimizer
         )
@@ -342,12 +335,14 @@ def main():
             model, validation_loader, criterion, device
         )
 
+        # Synchronise CUDA before recording runtime and memory statistics
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
         epoch_runtime = time.perf_counter() - epoch_start
         cumulative_runtime = time.perf_counter() - run_start
 
+        # Record peak GPU memory usage for the current epoch
         if device.type == "cuda":
             peak_allocated = (
                 torch.cuda.max_memory_allocated(device) / 1024**3
@@ -367,6 +362,7 @@ def main():
                 overall_peak_reserved, peak_reserved
             )
 
+        # Save a checkpoint whenever validation Dice improves
         improved = val_dice > best_dice
         if improved:
             best_dice = val_dice
@@ -382,6 +378,7 @@ def main():
                 "architecture": "modules.PaperUNet2D",
             }, args.output)
 
+        # Collect epoch metrics and performance measurements for the CSV
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -394,6 +391,7 @@ def main():
             "peak_gpu_reserved_gib": peak_reserved,
         }
 
+        # Add the individual foreground-class Dice scores
         for class_id in range(1, NUM_CLASSES):
             row[f"train_dice_class_{class_id}"] = (
                 train_class_dice[class_id]
@@ -402,7 +400,7 @@ def main():
                 val_class_dice[class_id]
             )
 
-        # Persist results immediately after each epoch.
+        # Persist results immediately after each epoch
         with csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=csv_fields)
             writer.writerow(row)
@@ -412,11 +410,13 @@ def main():
         if improved:
             print(f"  Saved best checkpoint to {args.output}")
 
+    # Print the best validation result and the locations of saved outputs
     total_runtime = time.perf_counter() - run_start
 
     print("\n=== Training Summary ===")
     print(f"Best validation Dice:   {best_dice:.4f}")
     print(f"Best epoch:             {best_epoch}")
+    print(f"Total runtime:          {total_runtime / 60:.2f}")
     print(f"Checkpoint path: {args.output}")
     print(f"CSV log path:    {csv_path}")
 

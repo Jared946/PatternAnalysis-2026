@@ -22,6 +22,7 @@ class DoubleConv(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
+        # Apply two consecutive valid convolutions with ReLU activations
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=0),
             nn.ReLU(inplace=True),
@@ -41,6 +42,7 @@ def center_crop(source: Tensor, target: Tensor) -> Tensor:
     error when an input slice is too small for this valid-convolution U-Net.
     """
 
+    # Calculate the spatial dimensions and ensure the source can be cropped
     source_h, source_w = source.shape[-2:]
     target_h, target_w = target.shape[-2:]
     if source_h < target_h or source_w < target_w:
@@ -49,6 +51,7 @@ def center_crop(source: Tensor, target: Tensor) -> Tensor:
             f"{source_h}x{source_w} to {target_h}x{target_w}. "
             "Use input slices large enough for four valid-convolution U-Net levels."
         )
+    # Calculate the central crop offsets and match the target dimensions
     top = (source_h - target_h) // 2
     left = (source_w - target_w) // 2
     return source[..., top : top + target_h, left : left + target_w]
@@ -59,6 +62,7 @@ class UpBlock(nn.Module):
 
     def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
         super().__init__()
+        # Upsample decoder features and combine them with cropped encoder features
         self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
         self.activation = nn.ReLU(inplace=True)
         self.conv = DoubleConv(out_channels + skip_channels, out_channels)
@@ -86,6 +90,7 @@ class UNet2D(nn.Module):
         self.num_classes = num_classes
         self.base_channels = base_channels
 
+        # Define the encoder blocks, progressively increasing feature channels
         self.down0 = DoubleConv(in_channels, c)
         self.pool0 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.down1 = DoubleConv(c, 2 * c)
@@ -95,33 +100,41 @@ class UNet2D(nn.Module):
         self.down3 = DoubleConv(4 * c, 8 * c)
         self.dropout3 = nn.Dropout2d(p=0.5)
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Define the bottleneck with the largest feature-channel dimension
         self.bottom = DoubleConv(8 * c, 16 * c)
         self.dropout4 = nn.Dropout2d(p=0.5)
 
+        # Define decoder blocks that upsample and combine encoder skip features
         self.up3 = UpBlock(16 * c, 8 * c, 8 * c)
         self.up2 = UpBlock(8 * c, 4 * c, 4 * c)
         self.up1 = UpBlock(4 * c, 2 * c, 2 * c)
-        # The reference prototxt has 128 output channels in this up-convolution.
+        # The reference prototxt has 128 output channels in this up-convolution
         self.up0 = UpBlock(2 * c, c, c)
+
+        # Map the final feature maps to the six segmentation classes
         self.final = nn.Conv2d(c, num_classes, kernel_size=1, padding=0)
 
     def forward(self, x: Tensor) -> Tensor:
+        # Validate the input tensor dimensions and channel count
         if x.ndim != 4:
             raise ValueError(f"Expected input [N, C, H, W], got shape {tuple(x.shape)}")
         if x.shape[1] != self.in_channels:
             raise ValueError(f"Expected {self.in_channels} input channels, got {x.shape[1]}")
 
+        # Pass through the encoder and bottleneck, retaining skip features
         d0 = self.down0(x)
         d1 = self.down1(self.pool0(d0))
         d2 = self.down2(self.pool1(d1))
         d3 = self.dropout3(self.down3(self.pool2(d2)))
         bottom = self.dropout4(self.bottom(self.pool3(d3)))
 
+        # Pass through the decoder, combining features from the encoder
         x = self.up3(bottom, d3)
         x = self.up2(x, d2)
         x = self.up1(x, d1)
         x = self.up0(x, d0)
-        return self.final(x)  # logits; CrossEntropyLoss applies softmax internally
+        return self.final(x)
 
 class PaperUNet2D(UNet2D):
     """Fixed-width paper U-Net with He-normal weight initialisation."""
@@ -132,6 +145,7 @@ class PaperUNet2D(UNet2D):
             num_classes=num_classes,
             base_channels=64,
         )
+        # Apply He-normal initialisation to the convolutional layers
         self.apply(paper_he_initialisation)
 
 
@@ -141,6 +155,7 @@ def crop_mask_to_logits(mask: Tensor, logits: Tensor) -> Tensor:
     Supports class-index masks [N, H, W] and one-hot masks
     [N, C, H, W].
     """
+    # Validate mask dimensions and determine the required output size
     if mask.ndim not in (3, 4):
         raise ValueError(
             f"Expected mask [N, H, W] or [N, C, H, W], "
@@ -153,6 +168,7 @@ def crop_mask_to_logits(mask: Tensor, logits: Tensor) -> Tensor:
     if h < target_h or w < target_w:
         raise ValueError("Mask is smaller than the network output.")
 
+    # Centre-crop the mask to align with the network output dimensions
     top = (h - target_h) // 2
     left = (w - target_w) // 2
 
@@ -160,6 +176,7 @@ def crop_mask_to_logits(mask: Tensor, logits: Tensor) -> Tensor:
 
 def paper_he_initialisation(module: nn.Module) -> None:
     """Initialise convolution weights using He-normal scheme."""
+    # Apply He-normal weight initialisation to convolutional layers
     if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
         kernel_h, kernel_w = module.kernel_size
         fan_in = (

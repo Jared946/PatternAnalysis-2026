@@ -17,6 +17,7 @@ from dataset import get_image_names, paper_unet_size
 from modules import PaperUNet2D
 
 def find_images(data_root: Path | None, images: Path | None) -> list[Path]:
+    # Retrieve MRI paths from the dataset or a specified file/directory
     if data_root:
         return get_image_names(data_root)
     if images is None:
@@ -26,25 +27,22 @@ def find_images(data_root: Path | None, images: Path | None) -> list[Path]:
     nested = images / "semantic_MRs_anon"
     return sorted((nested if nested.is_dir() else images).glob("*.nii.gz"))
 
-
-def normalise_slice(image: np.ndarray) -> np.ndarray:
-    image = image.astype(np.float32, copy=False)
-    return (image - image.mean()) / (image.std() + 1e-8)
-
 def predict_volume(
     model: PaperUNet2D,
     volume: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
+    # Validate the input volume and normalise its intensities
     if volume.ndim != 3:
         raise ValueError(f"Expected a 3-D MRI volume, got {volume.shape}")
 
-    # Normalise the entire volume before extracting slices.
+    # Normalise the entire volume before extracting slices
     volume = volume.astype(np.float32, copy=False)
     volume = (
         volume - volume.mean()
     ) / (volume.std() + 1e-8)
 
+    # Calculate the valid input dimensions and central crop offsets
     height, width, depth = volume.shape
 
     crop_height = paper_unet_size(height)
@@ -53,19 +51,22 @@ def predict_volume(
     crop_top = (height - crop_height) // 2
     crop_left = (width - crop_width) // 2
 
+    # Initialise the output volume with background labels
     result = np.zeros(volume.shape, dtype=np.uint8)
 
+    # Run inference on each 2D slice without calculating gradients
     with torch.inference_mode():
         for slice_idx in range(depth):
-            # Normalise the complete slice, matching the training dataset.
+            # Exract the current MRI slice
             image = volume[:, :, slice_idx]
 
-            # Apply the same central input crop as the training dataset.
+            # Apply the same central input crop as the training dataset
             image = image[
                 crop_top:crop_top + crop_height,
                 crop_left:crop_left + crop_width,
             ]
 
+            # Generate class predictions from the model output logits
             logits = model(
                 torch.from_numpy(image[None, None]).to(device)
             )
@@ -78,7 +79,7 @@ def predict_volume(
                 .astype(np.uint8)
             )
 
-            # Place the predicted region back in the original volume.
+            # Place the predicted region back in the original volume
             output_height, output_width = label_slice.shape
 
             top = (height - output_height) // 2
@@ -93,11 +94,13 @@ def predict_volume(
     return result
 
 def output_name(image_path: Path) -> str:
+    # Generate an output filename based on the original MRI filename
     name = image_path.name
     stem = name[:-7] if name.endswith(".nii.gz") else image_path.stem
     return f"{stem}_segmentation.nii.gz"
 
 def main():
+    # Configure command-line arguments for prediction
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path,
             default=Path('C:/Users/User/SEMESTER 2/COMP3710/project/HipMRI_Study_open'))
@@ -110,6 +113,7 @@ def main():
             default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    # Locate input volumes and load the trained model checkpoint
     paths = find_images(args.data_root, args.images)
     if not paths:
         raise FileNotFoundError("No MRI .nii.gz volumes found.")
@@ -118,19 +122,25 @@ def main():
             args.checkpoint,
             map_location=device,
             weights_only=False)
+    
+    # Reconstruct the model using the checkpoint configuration and weights
     model = PaperUNet2D(
             checkpoint.get("in_channels", 1),
             checkpoint.get("num_classes", 6)
             )
     model.load_state_dict(checkpoint["model_state"])
     model.to(device).eval()
+
+    # Create the output directory if it does not already exist
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Predict each volume and save the segmentation as a NIfTI file
     for image_path in paths:
         nifti = nib.load(str(image_path))
         prediction = predict_volume(model, np.asarray(nifti.dataobj), device)
         output_path = args.output_dir / output_name(image_path)
 
+        # Preserve the original volume geometry and update the output data type
         header = nifti.header.copy()
         header.set_data_dtype(np.uint8)
 
