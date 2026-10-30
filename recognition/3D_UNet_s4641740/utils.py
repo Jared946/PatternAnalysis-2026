@@ -1,3 +1,4 @@
+"""Utilities for evaluating and visualising 3D U-Net predictions."""
 from pathlib import Path
 
 import nibabel as nib
@@ -13,8 +14,7 @@ MRI_DIR = DATASET_DIR / "semantic_MRs"
 GT_DIR = DATASET_DIR / "semantic_labels_only"
 
 NUM_CLASSES = 6  # Background = 0, foreground classes = 1 to 5
-
-# Based on current patient split. Verify against dataset.py.
+    
 TEST_PATIENT_IDS = {"B040", "W041", "K042"}
 
 
@@ -22,6 +22,7 @@ def find_matching_file(folder, key, suffix):
     """Find exactly one file matching the selected case and suffix."""
     matches = list(folder.glob(f"*{key}{suffix}"))
 
+    # Report missing or ambiguous matches
     if len(matches) == 0:
         raise FileNotFoundError(
             f"No matching file found in:\n{folder}\n"
@@ -70,20 +71,21 @@ def calculate_dice(prediction, ground_truth):
     """Calculate per-class Dice and overall foreground Dice."""
     results = {}
 
+    # Calculate Dice separately for each foreground class
     for class_id in range(1, NUM_CLASSES):
         results[class_id] = dice_score(
             prediction == class_id,
             ground_truth == class_id,
         )
 
-    # All foreground voxels combined, regardless of class.
+    # Calculate Dice across all foreground voxels, regardless of class
     results["foreground"] = dice_score(
         prediction > 0,
         ground_truth > 0,
     )
 
-    # Macro average across classes present in either mask.
-    # Classes absent from both masks are excluded.
+    # Calculate macro Dice across classes present in either mask
+    # Classes absent from both masks are excluded
     present_scores = [
         score
         for class_id, score in results.items()
@@ -97,6 +99,7 @@ def calculate_dice(prediction, ground_truth):
     return results
 
 def print_dice(results):
+    """Print the calculated Dice metrics."""
     print("\n" + "=" * 48)
     print("DICE RESULTS")
     print("=" * 48)
@@ -111,6 +114,7 @@ def print_dice(results):
 
     print("-" * 48)
 
+    # Display overall foreground and macro foreground Dice
     for name, label in [
         ("foreground", "Overall foreground Dice"),
         ("macro_foreground", "Mean foreground class Dice"),
@@ -124,22 +128,25 @@ def print_dice(results):
 def display_case(mri, ground_truth, prediction, slice_index, key):
     """Compare MRI, masks, exact-label errors and foreground errors."""
 
+    # Extract the selected axial slice and transpose for display
     image_slice = mri[:, :, slice_index].T
     gt_slice = ground_truth[:, :, slice_index].T
     pred_slice = prediction[:, :, slice_index].T
 
-    # True wherever the predicted class differs from the ground truth.
+    # Compare predicted and ground-truth labels at each voxel
     exact_errors = pred_slice != gt_slice
 
-    # True wherever foreground/background membership differs.
+    # Identify disagreements specifically between foreground and background
     foreground_errors = (pred_slice > 0) != (gt_slice > 0)
 
+    # Create a six-panel figure for visual comparison
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     axes = axes.ravel()
 
     axes[0].imshow(image_slice, cmap="gray", origin="lower")
     axes[0].set_title("Original MRI")
 
+    # Use a consistent colour for each segmentation class
     label_cmap = ListedColormap([
         "black", "red", "lime", "blue", "yellow", "magenta"
     ])
@@ -158,7 +165,7 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
     )
     axes[2].set_title("Prediction")
 
-    # Black = exact label match; white = any label mismatch.
+    # Display every voxel where the predicted class differs from the ground truth
     axes[3].imshow(
         exact_errors, cmap="gray",
         vmin=0, vmax=1, interpolation="nearest", origin="lower"
@@ -167,7 +174,7 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
         f"Exact-label errors: {exact_errors.sum()} voxels"
     )
 
-    # Only counts disagreement between foreground and background.
+    # Display only disagreements between foreground and background
     axes[4].imshow(
         foreground_errors, cmap="gray",
         vmin=0, vmax=1, interpolation="nearest", origin="lower"
@@ -176,7 +183,7 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
         f"Foreground errors: {foreground_errors.sum()} voxels"
     )
 
-    # MRI with exact-label errors highlighted in white.
+    # Overlay exact-label errors on the original MRI in white
     axes[5].imshow(image_slice, cmap="gray", origin="lower")
     error_overlay = np.ma.masked_where(
         ~exact_errors, exact_errors.astype(float)
@@ -188,6 +195,7 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
     )
     axes[5].set_title("MRI + errors in white")
 
+    # Remove axis markings and add the case and slice information
     for ax in axes:
         ax.set_axis_off()
 
@@ -199,6 +207,7 @@ def display_case(mri, ground_truth, prediction, slice_index, key):
     plt.show()
 
 def main():
+    # Ask the user for a substring identifying the volume to evaluate
     print("HipMRI 3D U-Net evaluation")
     print("Enter a substring from the filenames, e.g. 006_Week0")
     key = input("Case key: ").strip()
@@ -207,6 +216,7 @@ def main():
         print("No case key entered.")
         return
 
+    # Locate the MRI, ground-truth segmentation and predicted segmentation
     mri_path = find_matching_file(
         MRI_DIR, key, "_LFOV.nii.gz"
     )
@@ -222,6 +232,7 @@ def main():
     print(f"Ground truth: {gt_path}")
     print(f"Prediction: {pred_path}")
 
+    # Warn if the selected case is not part of the held-out test partition
     patient_id = mri_path.name.split("_")[0]
 
     if patient_id in TEST_PATIENT_IDS:
@@ -232,10 +243,12 @@ def main():
             "patient list."
         )
 
+    # Load all three volumes and their spatial metadata
     mri, mri_affine = load_volume(mri_path)
     gt, gt_affine = load_volume(gt_path)
     pred, pred_affine = load_volume(pred_path)
 
+    # Ensure all volumes have matching dimensions
     if mri.shape != gt.shape or gt.shape != pred.shape:
         raise ValueError(
             "Volume shape mismatch:\n"
@@ -244,6 +257,7 @@ def main():
             f"Prediction: {pred.shape}"
         )
 
+    # Check that the volumes share the same spatial coordinate system
     if not (
         np.allclose(mri_affine, gt_affine)
         and np.allclose(gt_affine, pred_affine)
@@ -253,6 +267,7 @@ def main():
             "are spatially aligned before calculating Dice."
         )
 
+    # Validate segmentation values before calculating metrics
     for name, volume in [
         ("Ground truth", gt),
         ("Prediction", pred),
@@ -272,6 +287,7 @@ def main():
                 f"{name} contains unexpected labels: {sorted(labels)}"
             )
 
+    # Convert validated segmentation volumes to integer label arrays
     gt = np.round(gt).astype(np.int16)
     pred = np.round(pred).astype(np.int16)
 
@@ -279,9 +295,11 @@ def main():
     print(f"Ground-truth labels: {np.unique(gt)}")
     print(f"Prediction labels:   {np.unique(pred)}")
 
+    # Calculate and display segmentation metrics
     results = calculate_dice(pred, gt)
     print_dice(results)
 
+    # Ask which slice to visualise, defaulting to the middle slice
     slice_text = input(
         f"\nSlice index (0-{mri.shape[2] - 1}, "
         "press Enter for middle slice): "

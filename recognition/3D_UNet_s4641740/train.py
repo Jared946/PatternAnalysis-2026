@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import csv
 import time
-import os
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -44,7 +43,8 @@ class CrossEntropyDiceLoss(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss()
 
     def forward(self, logits, targets_one_hot):
-        # logits:        [N,C,D,H,W]
+        # Check that predictions and one-hot targets have matching 3D shapes
+        # logits:          [N,C,D,H,W]
         # targets_one_hot: [N,C,D,H,W]
         if logits.ndim != 5:
             raise ValueError(
@@ -53,19 +53,20 @@ class CrossEntropyDiceLoss(nn.Module):
 
         if targets_one_hot.shape != logits.shape:
             raise ValueError(
-                f"Expected ont-hot targets shaped like logits; "
+                f"Expected one-hot targets shaped like logits; "
                 f"got targets={tuple(targets_one_hot.shape)}, "
                 f"logits={tuple(logits.shape)}"
             )
 
-        # Recover integer class IDs for CrossEntropyLoss
+        # Cross-entropy expects integer class IDs, not one-hot masks
         targets = targets_one_hot.argmax(dim=1).long()
         ce = self.ce_loss(logits, targets)
 
-        # Use dataset's one-hot encoding for Dice loss
+        # Calculate soft Dice using the one-hot targets and predicted probabilities
         target_probs = targets_one_hot.to(dtype=logits.dtype)
         probabilities = torch.softmax(logits, dim=1)
 
+        # Sum intersections and class volumes across the batch and spatial dimensions
         dims = (0, 2, 3, 4)
 
         intersection = (
@@ -82,35 +83,14 @@ class CrossEntropyDiceLoss(nn.Module):
             denominator + self.smooth
         )
 
+        # Exclude background class 0 from the Dice loss
         dice_loss = 1.0 - dice_per_class[1:].mean()
 
+        # Combine the weighted cross-entropy and Dice losses
         return (
             self.ce_weight * ce
             + self.dice_weight * dice_loss
         )
-
-def dice(logits, target):
-    """Calculate mean foreground Dice for one batch.
-
-    Accepts integer targets [N,D,H,W] or one-hot targets
-    [N,C,D,H,W]. Background is excluded.
-    """
-    prediction = logits.argmax(dim=1)
-
-    if target.ndim == logits.ndim:
-        target = target.argmax(dim=1)
-    scores = []
-    for c in range(1, NUM_CLASSES):
-        pred_mask = prediction == c
-        target_mask = target == c
-
-        denominator = pred_mask.sum().item() + target_mask.sum().item()
-
-        if denominator > 0:
-            intersection = (pred_mask & target_mask).sum().item()
-            scores.append(2.0 * intersection / denominator)
-
-    return float(np.mean(scores)) if scores else 1.0
 
 def epoch(model, loader, loss_fn, device, optimizer = None):
     """Run one training or validation epoch.
@@ -126,9 +106,11 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
     batch_count = 0
     samples_seen = 0
 
+    # Accumulate foreground intersections and denominators across all batches
     intersections = np.zeros(NUM_CLASSES, dtype=np.float64)
     denominators = np.zeros(NUM_CLASSES, dtype=np.float64)
 
+    # Enable gradient calculation only during training
     with torch.set_grad_enabled(training):
         for images, targets in loader:
             samples_seen += images.shape[0]
@@ -136,12 +118,13 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # Convert one-hot masks to integer IDs for hard Dice metrics.
+            # Convert one-hot masks to integer IDs for hard Dice metrics
             target_ids = targets.argmax(dim=1)
 
             logits = model(images)
             loss = loss_fn(logits, targets)
 
+            # Update model weights only during training
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -150,6 +133,7 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             loss_sum += loss.item()
             batch_count += 1
 
+            # Accumulate hard Dice statistics for each foreground class
             predictions = logits.detach().argmax(dim=1)
 
             for c in range(1, NUM_CLASSES):
@@ -165,6 +149,7 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
                     + target_mask.sum().item()
                 )
 
+    # Ensure the loader contained data and every sample was processed
     if batch_count == 0:
         raise ValueError(
             "The DataLoader contains no batches. Check the patient split "
@@ -179,6 +164,7 @@ def epoch(model, loader, loss_fn, device, optimizer = None):
             f"but processed {samples_seen}."
         )
 
+    # Calculate mean foreground Dice from the accumulated voxel counts
     class_scores = []
 
     for c in range(1, NUM_CLASSES):
@@ -201,6 +187,7 @@ def evaluate_test(model, test_loader, device):
     """
     model.eval()
 
+    # Store accumulated Dice statistics separately for each patient
     # patient_id -> per-class intersection and denominator
     patient_stats = {}
     volume_index = 0
@@ -219,14 +206,15 @@ def evaluate_test(model, test_loader, device):
                     "Full-volume test evaluation requires batch_size=1."
                 )
 
+            # Identify the patient associated with the current volume
             image_path = test_loader.dataset.pairs[volume_index][0]
             volume_index += 1
             pid = image_path.name.split("_")[0]
 
-            # Preserve the original spatial dimensions.
+            # Preserve the original spatial dimensions before padding
             _, _, d, h, w = images.shape
 
-            # Pad at the end of each dimension to multiples of 16.
+            # Pad at the end of each dimension to multiples of 16
             pd = (-d) % 16
             ph = (-h) % 16
             pw = (-w) % 16
@@ -240,10 +228,11 @@ def evaluate_test(model, test_loader, device):
 
             logits = model(images)
 
-            # Remove the padding from the predictions.
+            # Remove the padding from the predictions
             logits = logits[:, :, :d, :h, :w]
             predictions = logits.argmax(dim=1)
 
+            # Initialise metric accumulators for a patient when first encountered
             if pid not in patient_stats:
                 patient_stats[pid] = {
                     "intersection": np.zeros(NUM_CLASSES, dtype=np.float64),
@@ -252,6 +241,7 @@ def evaluate_test(model, test_loader, device):
 
             stats = patient_stats[pid]
 
+            # Accumulate voxel-level Dice statistics across the patient's volumes
             for c in range(1, NUM_CLASSES):
                 pred_mask = predictions == c
                 target_mask = target_ids == c
@@ -266,7 +256,7 @@ def evaluate_test(model, test_loader, device):
                 )
 
     # Calculate Dice for each patient, excluding classes absent from
-    # both prediction and target for that patient.
+    # both prediction and target for that patient
     patient_scores = {}
     class_scores = {c: [] for c in range(1, NUM_CLASSES)}
 
@@ -289,6 +279,7 @@ def evaluate_validation(model, loader, loss_fn, device):
     """Evaluate full validation volumes and calculate patient-level Dice."""
     model.eval()
 
+    # Accumulate validation metrics by patient across all their volumes
     patient_stats = {}
     loss_sum = 0.0
     volume_count = 0
@@ -298,20 +289,23 @@ def evaluate_validation(model, loader, loss_fn, device):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # Integer IDs are used for hard Dice evaluation.
+            # Integer IDs are used for hard Dice evaluation
             target_ids = targets.argmax(dim=1)
 
+            # Batch size must be 1 because full volumes can differ in size
             if images.shape[0] != 1:
                 raise ValueError(
                     "Full-volume validation requires batch_size=1."
                 )
 
+            # Identify the patient associated with the current volume
             image_path = loader.dataset.pairs[index][0]
             pid = image_path.name.split("_")[0]
 
+            # Preserve the original spatial dimensions before padding
             _, _, d, h, w = images.shape
 
-            # Pad dimensions to multiples of 16 for the 3D U-Net.
+            # Pad dimensions to multiples of 16 for the 3D U-Net
             pd = (-d) % 16
             ph = (-h) % 16
             pw = (-w) % 16
@@ -325,15 +319,17 @@ def evaluate_validation(model, loader, loss_fn, device):
 
             logits = model(images)
 
-            # Remove padding so predictions match the original target.
+            # Remove padding so predictions match the original target
             logits = logits[:, :, :d, :h, :w]
 
+            # Calculate validation loss on the unpadded volume
             loss = loss_fn(logits, targets)
             loss_sum += loss.item()
             volume_count += 1
 
             predictions = logits.argmax(dim=1)
 
+            # Initialise metric accumulators for each patient
             if pid not in patient_stats:
                 patient_stats[pid] = {
                     "intersection": np.zeros(NUM_CLASSES),
@@ -342,6 +338,7 @@ def evaluate_validation(model, loader, loss_fn, device):
 
             stats = patient_stats[pid]
 
+            # Accumulate voxel-level Dice statistics for each foreground class
             for c in range(1, NUM_CLASSES):
                 pred_mask = predictions == c
                 target_mask = target_ids == c
@@ -358,6 +355,7 @@ def evaluate_validation(model, loader, loss_fn, device):
     if volume_count == 0:
         raise ValueError("Validation loader contains no volumes.")
 
+    # Calculate each patient's mean foreground Dice, then average across patients
     patient_scores = []
     per_class_patient_scores = {
         c: [] for c in range(1, NUM_CLASSES)
@@ -383,6 +381,7 @@ def evaluate_validation(model, loader, loss_fn, device):
     if not patient_scores:
         raise ValueError("No foreground Dice scores could be calculated.")
 
+    # Calculate the mean Dice for each foreground class across patients
     per_class_dice = {
         c: (
             float(np.mean(scores))
@@ -402,6 +401,7 @@ def evaluate_validation(model, loader, loss_fn, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
 
+    # Configure dataset, checkpoint, model, training and device options
     parser.add_argument(
         "--data-root",
         type=Path,
@@ -437,7 +437,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Reproducibility.
+    # Set random seeds for reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -445,7 +445,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Find MRI volumes and corresponding masks.
+    # Discover MRI volumes, their corresponding labels and patient IDs
     images = get_image_names(args.data_root)
 
     if not images:
@@ -456,12 +456,14 @@ def main():
     labels = get_label_names(images, args.data_root)
     patient_ids = get_patient_ids(images)
 
+    # Assign patients to separate training, validation and test partitions
     train_ids, val_ids, test_ids = split_patients(patient_ids)
 
     train_pairs = select_pairs(images, labels, train_ids)
     val_pairs = select_pairs(images, labels, val_ids)
     test_pairs = select_pairs(images, labels, test_ids)
 
+    # Ensure that all three partitions contain matching MRI and label pairs
     if not train_pairs:
         raise ValueError("No training volumes matched the training IDs.")
     if not val_pairs:
@@ -469,7 +471,7 @@ def main():
     if not test_pairs:
         raise ValueError("No test volumes matched the test IDs.")
 
-    # Verify that every discovered MRI volume appears in exactly one split.
+    # Verify that every discovered MRI volume appears in exactly one split
     all_pairs = train_pairs + val_pairs + test_pairs
 
     all_image_paths = [str(pair[0]) for pair in all_pairs]
@@ -484,19 +486,8 @@ def main():
         "or unexpected volumes have been included!"
     )
 
-    # Verify patient-level split integrity.
-    def pair_patient_id(pair):
-        return pair[0].name.split("_")[0]
-
-    for name, pairs, allowed_ids in [
-        ("Training", train_pairs, train_ids),
-        ("Validation", val_pairs, val_ids),
-        ("Test", test_pairs, test_ids),
-    ]:
-        actual_ids = {pair_patient_id(pair) for pair in pairs}
-
-    # Training uses random patches, validation uses the dataset's
-    # default patch selection behaviour.
+    # Create datasets: random patches for training and complete volumes
+    # for validation and test evaluation
     train_ds = MRI3DVolumeDataset(
         *zip(*train_pairs),
         patch_size=tuple(args.patch_size),
@@ -513,12 +504,14 @@ def main():
 
     device = torch.device(args.device)
 
+    # Shared settings for the training DataLoader
     common_loader_args = {
         "batch_size": args.batch_size,
         "num_workers": args.workers,
         "pin_memory": device.type == "cuda",
     }
 
+    # Shuffle training patches, but preserve volume order for evaluation
     train_loader = DataLoader(
         train_ds,
         shuffle=True,
@@ -539,6 +532,7 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
+    # Initialise the 3D U-Net, optimiser and combined loss function
     model = UNet3D(base_channels=args.base_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -548,15 +542,15 @@ def main():
         dice_weight=1.0,
     ).to(device)
 
+    # Create the checkpoint directory and CSV log path
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Store the CSV alongside the checkpoint.
     csv_path = args.output.with_suffix(".csv")
 
     best_val_dice = -float("inf")
     checkpoint_saved = False
 
-    # Track the highest per-epoch peaks for the overall summary.
+    # Track the highest GPU memory usage observed across epochs
     overall_peak_allocated = 0.0
     overall_peak_reserved = 0.0
 
@@ -566,6 +560,7 @@ def main():
     print(f"Checkpoint: {args.output}")
     print(f"CSV log: {csv_path}\n")
 
+    # Define the metrics recorded after every epoch
     csv_fields = [
         "epoch",
         "train_loss",
@@ -579,7 +574,7 @@ def main():
         "learning_rate",
     ]
 
-    # Start a new log for this run.
+    # Start a new log for this run and record each epoch's results
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
         writer.writeheader()
@@ -587,14 +582,14 @@ def main():
 
         for e in range(1, args.epochs + 1):
             # Reset peak statistics so memory is measured separately
-            # for each epoch, including training and validation.
+            # for each epoch, including training and validation
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
 
             epoch_start = time.perf_counter()
 
-            # Training.
+            # Train the model on randomly sampled patches
             train_loss, train_dice = epoch(
                 model,
                 train_loader,
@@ -603,7 +598,7 @@ def main():
                 optimizer,
             )
 
-            # Validation.
+            # Evaluate on complete validation volumes
             val_loss, val_dice, val_class_dice = evaluate_validation(
                 model,
                 val_loader,
@@ -611,7 +606,7 @@ def main():
                 device,
             )
 
-            # Save the checkpoint with the best validation Dice.
+            # Save the model whenever it achieves a new best validation Dice
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
 
@@ -633,13 +628,13 @@ def main():
                 print(f"Saved best checkpoint to {args.output}")
 
             # Synchronise before stopping the timer so CUDA operations
-            # are included in the epoch duration.
+            # are included in the epoch duration
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
 
             epoch_seconds = time.perf_counter() - epoch_start
 
-            # GPU memory peaks for this epoch.
+            # Record peak GPU memory usage for this epoch
             if device.type == "cuda":
                 peak_allocated = (
                     torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -662,7 +657,7 @@ def main():
 
             print(f"\nEpoch {e:03d}/{args.epochs}")
 
-            # Persist this epoch's metrics immediately.
+            # Write the epoch metrics to CSV
             writer.writerow(
                 {
                     "epoch": e,
@@ -679,6 +674,7 @@ def main():
             )
             csv_file.flush()
 
+    # Calculate total runtime after all training epochs have completed
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -691,6 +687,7 @@ def main():
     print(f"Checkpoint path:        {args.output}")
     print(f"CSV log path:           {csv_path}")
 
+    # Load the best checkpoint and evaluate it on the held-out test set
     if not checkpoint_saved:
         raise RuntimeError("No best checkpoint was saved; cannot evaluate test set.")
 
@@ -698,7 +695,13 @@ def main():
     model.load_state_dict(checkpoint["model_state"])
 
     print(f"\nLoaded best checkpoint from epoch {checkpoint['epoch']}")
-    evaluate_test(model, test_loader, device)
+    test_scores = evaluate_test(model, test_loader, device)
 
-if __name__=='__main__':
+    print("\n=== TEST RESULTS ===")
+    for pid, score in test_scores.items():
+        print(f"{pid}: {score:.4f}")
+
+    print(f"Mean patient Dice: {np.mean(list(test_scores.values())):.4f}")
+
+if __name__ == '__main__':
     main()
